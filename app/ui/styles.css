@@ -8,6 +8,11 @@
   box-sizing: border-box;
 }
 
+/* hidden 属性兜底：display 类样式（如 .form-grid 的 display:grid）会覆盖浏览器默认的
+   [hidden]{display:none}，导致代码中 hidden=true 的元素仍可见（例如查看日程时出现空的下拉框）。
+   用 !important 确保所有 hidden 元素真正隐藏。 */
+[hidden] { display: none !important; }
+
 :root {
   --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", "Microsoft YaHei", sans-serif;
   --toolbar-h: 52px;
@@ -1099,3 +1104,39 @@ body {
 
 /* 新建日程弹窗：日历选择下拉 */
 .ev-cal-select { min-width: 0; height: 34px; }
+
+/* ============ 日程编辑弹窗：提示条 ============ */
+.form-hint {
+  font-size: 12px;
+  color: #8a6d1a;
+  background: rgba(250, 173, 20, 0.1);
+  border: 1px solid rgba(250, 173, 20, 0.25);
+  border-radius: 6px;
+  padding: 6px 9px;
+  margin-bottom: 12px;
+  line-height: 1.5;
+}
+
+/* ============ 日程拖拽改期 ============ */
+.ev-pill[draggable='true'],
+.ev-block[draggable='true'],
+.all-day-cols .ev-pill[draggable='true'] {
+  cursor: grab;
+}
+.ev-pill.drag-source, .ev-block.drag-source { opacity: 0.4; }
+.day-cell.drop-target { background: rgba(30, 136, 229, 0.10); box-shadow: inset 0 0 0 2px var(--accent-blue); }
+.day-cell.out-month.drop-target { background: rgba(30, 136, 229, 0.08); }
+.week-cols .col.drop-target { background: rgba(30, 136, 229, 0.06); }
+.all-day-cols .col.drop-target { background: rgba(30, 136, 229, 0.10); }
+.all-day-cols .col.drop-line { box-shadow: inset 0 2px 0 var(--accent-blue); }
+
+/* 远程系列实例（重复日程展开的某一两次）：虚线内框提示属于系列 */
+.ev-pill.recur, .ev-block.recur {
+  box-shadow: inset 0 0 0 1.5px dashed rgba(255, 255, 255, 0.65);
+}
+
+/* 可写的远程日程（飞书）：实线内框 + 常规背景，与只读订阅区分 */
+.ev-pill.writable-remote, .ev-block.writable-remote {
+  box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.85);
+}
+

@@ -39,6 +39,8 @@ const state = {
   remoteEvents: [],         // 远程日历缓存事件
   hiddenCals: new Set(JSON.parse(localStorage.getItem('fnCalHidden') || '[]')),
   syncedThisSession: false,
+  dragEv: null,             // 正在拖拽改期的日程
+  dragGrabMin: 0,           // 按住点相对事件块顶部的分钟偏移（还原抓取位置）
 };
 
 /* ---------------- API 助手 ---------------- */
@@ -521,14 +523,22 @@ function buildDayCell(c) {
   const cellEvents = eventsOfDay(new Date(c.year, c.month - 1, c.day));
   const visible = cellEvents.slice(0, 3);
   visible.forEach((ev) => {
-    const pill = el('div', 'ev-pill' + (ev.remote ? ' remote' : ''), ev.title);
+    let cls = 'ev-pill' + (ev.remote ? ' remote' : '');
+    if (isRecurringInstance(ev)) cls += ' recur';
+    else if (isFeishuEvent(ev)) cls += ' writable-remote';
+    const pill = el('div', cls, ev.title);
     pill.style.background = evColor(ev);
-    pill.title = ev.title + (ev.remote ? '（' + ev.calendarName + '，只读）' : '') + (ev.allDay ? '' : ' ' + fmtTime(ev.start) + '-' + fmtTime(ev.end));
+    const tipRemote = ev.remote
+      ? isFeishuEvent(ev)
+        ? (isRecurringInstance(ev) ? '（' + ev.calendarName + '·重复系列，可编辑整体系列）' : '（' + ev.calendarName + '，可编辑/拖拽）')
+        : '（' + ev.calendarName + '，只读订阅）'
+      : '';
+    pill.title = ev.title + tipRemote + (ev.allDay ? '' : ' ' + fmtTime(ev.start) + '-' + fmtTime(ev.end));
     pill.addEventListener('click', (e) => {
       e.stopPropagation();
-      if (ev.remote) openViewer(ev);
-      else openEditor('edit', ev);
+      openEvent(ev);
     });
+    setupDragSource(pill, ev);
     evWrap.appendChild(pill);
   });
   if (cellEvents.length > 3) {
@@ -552,6 +562,8 @@ function buildDayCell(c) {
   cell.addEventListener('dblclick', () => {
     openEditor('create', new Date(c.year, c.month - 1, c.day));
   });
+  // 拖拽落点：把日程改期到该日
+  bindDayCellDrop(cell, new Date(c.year, c.month - 1, c.day));
   return cell;
 }
 
@@ -596,18 +608,25 @@ function buildTimeline(type) {
   days.forEach((d) => {
     const col = el('div', 'col');
     eventsOfDay(d).filter((ev) => ev.allDay).forEach((ev) => {
-      const pill = el('div', 'ev-pill' + (ev.remote ? ' remote' : ''), ev.title);
+      let cls = 'ev-pill' + (ev.remote ? ' remote' : '');
+      if (isRecurringInstance(ev)) cls += ' recur';
+      else if (isFeishuEvent(ev)) cls += ' writable-remote';
+      const pill = el('div', cls, ev.title);
       pill.style.background = evColor(ev);
-      pill.title = ev.title + (ev.remote ? '（' + ev.calendarName + '，只读）' : '');
-      pill.addEventListener('click', () => {
-        if (ev.remote) openViewer(ev);
-        else openEditor('edit', ev);
-      });
+      pill.title = ev.title + (ev.remote
+        ? (isFeishuEvent(ev)
+          ? (isRecurringInstance(ev) ? '（' + ev.calendarName + '·重复系列，可编辑整体系列）' : '（' + ev.calendarName + '，可编辑/拖拽）')
+          : '（' + ev.calendarName + '，只读订阅）')
+        : '');
+      pill.addEventListener('click', () => openEvent(ev));
+      setupDragSource(pill, ev);
       col.appendChild(pill);
     });
     if (col.childElementCount === 0) {
       col.addEventListener('dblclick', () => openEditor('create', d));
     }
+    // 全天行作为拖拽落点：定时/全天日程拖入 → 视为移动到该日（时间不变；日历语义一致）
+    bindDayCellDrop(col, d);
     adCols.appendChild(col);
   });
   adr.appendChild(adCols);
@@ -651,6 +670,8 @@ function buildTimeline(type) {
       const mins = Math.floor(y / HOUR_H * 60);
       openEditor('create', d2, mins);
     });
+    // 拖拽落点：按列内纵向位置改期（定时/全天日程均可落）
+    bindTimeColDrop(col, d);
     cols.appendChild(col);
   });
   grid.appendChild(cols);
@@ -668,6 +689,161 @@ function buildTimeline(type) {
   wrap.appendChild(grid);
   view.appendChild(wrap);
   return view;
+}
+
+/* ---------------- 远程日程可编辑性 & 拖拽改期 ---------------- */
+
+/** 按 id 找日历源（本地事件无 calendarId） */
+function findCal(calId) {
+  return state.calendars.find((c) => c.id === calId) || null;
+}
+
+/** 远程事件的 id 含 '#' 表示是重复日程展开的某次实例（见后端 feishuSeriesId） */
+function isRecurringInstance(ev) {
+  return !!(ev && ev.remote && typeof ev.id === 'string' && ev.id.indexOf('#') > 0);
+}
+
+/** 事件是否来自飞书日历（可写远程） */
+function isFeishuEvent(ev) {
+  if (!ev || !ev.remote) return false;
+  const c = findCal(ev.calendarId);
+  return !!(c && c.type === 'feishu');
+}
+
+/** 事件是否可编辑/拖拽：本地日程恒可；远程仅飞书日历的非重复实例可写 */
+function isEventWritable(ev) {
+  if (!ev) return false;
+  if (ev.remote) return isFeishuEvent(ev) && !isRecurringInstance(ev);
+  return true;
+}
+
+/** 打开日程：本地 / 飞书可写日程 → 编辑弹窗；只读订阅（ICS/CalDAV）→ 只读查看 */
+function openEvent(ev) {
+  if (ev.remote && !isFeishuEvent(ev)) return openViewer(ev);
+  openEditor('edit', ev);
+}
+
+/* —— 拖拽改期 —— */
+
+const DND_MIME = 'application/x-fncal';
+
+function setupDragSource(node, ev) {
+  node.draggable = isEventWritable(ev);
+  if (!node.draggable) return;
+  node.addEventListener('dragstart', (e) => {
+    state.dragEv = ev;
+    try {
+      e.dataTransfer.setData(DND_MIME, JSON.stringify({
+        id: ev.id, calendarId: ev.calendarId || '', remote: !!ev.remote, allDay: !!ev.allDay,
+        start: ev.start, end: ev.end,
+      }));
+      e.dataTransfer.effectAllowed = 'move';
+    } catch (err) { /* 忽略 setData 异常 */ }
+    // 记录鼠标相对事件块顶部的偏移（分钟），落点据此还原
+    const rect = node.getBoundingClientRect();
+    state.dragGrabMin = (e.clientY - rect.top) / HOUR_H * 60;
+    node.classList.add('drag-source');
+  });
+  node.addEventListener('dragend', () => {
+    state.dragEv = null;
+    state.dragGrabMin = 0;
+    node.classList.remove('drag-source');
+    document.querySelectorAll('.drop-target, .drop-line').forEach((n) => n.classList.remove('drop-target', 'drop-line'));
+  });
+}
+
+function hasDndData(e) {
+  if (!state.dragEv) return false;
+  if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.length) {
+    // types 可读时精确匹配自定义 MIME，避免响应外部拖入的文本/文件
+    return Array.from(e.dataTransfer.types).indexOf(DND_MIME) >= 0;
+  }
+  return true; // 个别浏览器 dragover 阶段 types 为空：退化为信任当前拖拽状态
+}
+
+/** 计算拖拽改期后的 { start, end, allDay }：toDate 为目标所在日期，slotMin 为开始时刻（定时事件；undefined=保留原时分） */
+function buildMovedTimes(ev, toDate, slotMin) {
+  const allDay = !!ev.allDay;
+  let s = allDay ? parseDate(ev.start) : parseDT(ev.start);
+  let e = allDay ? parseDate(ev.end) : parseDT(ev.end);
+  if (!s || !e) return null;
+  const day0 = new Date(toDate.getFullYear(), toDate.getMonth(), toDate.getDate());
+  if (allDay) {
+    const days = Math.round((e.getTime() - s.getTime()) / DAY_MS);
+    const ns = day0;
+    const ne = addDays(day0, days);
+    return { start: fmtDate(ns), end: fmtDate(ne), allDay: true };
+  }
+  const dur = e.getTime() - s.getTime();
+  let min = slotMin;
+  if (min === undefined) min = s.getHours() * 60 + s.getMinutes();
+  const ns = new Date(day0.getTime() + min * 60000);
+  const ne = new Date(ns.getTime() + (dur > 0 ? dur : 3600000));
+  return { start: fmtDT(ns), end: fmtDT(ne), allDay: false };
+}
+
+/** 落点执行：把日程移动到新时间，并 PUT 写回（本地 / 飞书） */
+async function applyMove(ev, times) {
+  if (!times) return;
+  const path = ev.remote
+    ? '/api/calendars/' + encodeURIComponent(ev.calendarId) + '/events/' + encodeURIComponent(ev.id)
+    : '/api/events/' + ev.id;
+  await apiSend('PUT', path, { start: times.start, end: times.end, allDay: times.allDay });
+  await refreshAll();
+}
+
+/** 供日/周视图 drop 绑定的处理器：按列内坐标计算目标分钟 */
+function bindTimeColDrop(col, day) {
+  col.addEventListener('dragover', (e) => {
+    if (!hasDndData(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    col.classList.add('drop-target');
+  });
+  col.addEventListener('dragleave', () => col.classList.remove('drop-target'));
+  col.addEventListener('drop', async (e) => {
+    if (!hasDndData(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    col.classList.remove('drop-target');
+    const rect = col.getBoundingClientRect();
+    const y = e.clientY - rect.top;
+    let min = Math.floor(y / HOUR_H * 60);
+    if (state.dragGrabMin) min -= Math.round(state.dragGrabMin);
+    min = Math.round(min / 5) * 5;
+    min = Math.max(0, Math.min(23 * 60 + 55, min));
+    const ev = state.dragEv;
+    if (!ev) return;
+    try {
+      await applyMove(ev, buildMovedTimes(ev, day, min));
+    } catch (ex) {
+      alert('移动日程失败：' + ex.message);
+    }
+  });
+}
+
+/** 供月视图 day-cell 绑定的处理器：拖到该日（定时事件保留原时分） */
+function bindDayCellDrop(cell, date) {
+  cell.addEventListener('dragover', (e) => {
+    if (!hasDndData(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    cell.classList.add('drop-target');
+  });
+  cell.addEventListener('dragleave', () => cell.classList.remove('drop-target'));
+  cell.addEventListener('drop', async (e) => {
+    if (!hasDndData(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    cell.classList.remove('drop-target');
+    const ev = state.dragEv;
+    if (!ev) return;
+    try {
+      await applyMove(ev, buildMovedTimes(ev, date, undefined));
+    } catch (ex) {
+      alert('移动日程失败：' + ex.message);
+    }
+  });
 }
 
 function eventsOfDay(d) {
@@ -694,7 +870,10 @@ function buildEvBlock(ev, day) {
   const top = (sClipped.getHours() * 60 + sClipped.getMinutes()) / 60 * HOUR_H;
   const height = Math.max((eClipped - sClipped) / (60 * 1000) / 60 * HOUR_H, 22);
 
-  const block = el('div', 'ev-block' + (ev.remote ? ' remote' : ''));
+  let cls = 'ev-block' + (ev.remote ? ' remote' : '');
+  if (isRecurringInstance(ev)) cls += ' recur';
+  else if (isFeishuEvent(ev)) cls += ' writable-remote';
+  const block = el('div', cls);
   block.style.top = top + 'px';
   block.style.height = height + 'px';
   block.style.background = evColor(ev);
@@ -702,11 +881,17 @@ function buildEvBlock(ev, day) {
   if (height > 34) {
     block.appendChild(el('div', 's', fmtTime(ev.start) + ' — ' + fmtTime(ev.end)));
   }
-  block.title = ev.title + (ev.remote ? '（' + ev.calendarName + '，只读）' : '') + ' ' + fmtTime(ev.start) + ' — ' + fmtTime(ev.end);
-  block.addEventListener('click', () => {
-    if (ev.remote) openViewer(ev);
-    else openEditor('edit', ev);
+  const tipRemote = ev.remote
+    ? isFeishuEvent(ev)
+      ? (isRecurringInstance(ev) ? '（' + ev.calendarName + '·重复系列，可编辑整体系列）' : '（' + ev.calendarName + '，可编辑/拖拽）')
+      : '（' + ev.calendarName + '，只读订阅）'
+    : '';
+  block.title = ev.title + tipRemote + ' ' + fmtTime(ev.start) + ' — ' + fmtTime(ev.end);
+  block.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openEvent(ev);
   });
+  setupDragSource(block, ev);
   return block;
 }
 
@@ -805,8 +990,8 @@ function navigate(delta) {
 
 function openEditor(mode, arg, startMin) {
   if (mode === 'edit') {
-    // arg 为要编辑的日程对象
-    state.editing = { mode, event: Object.assign({}, arg) };
+    // arg 为要编辑的日程对象；original 为打开时的快照（保存时用于判断是否变更了时间）
+    state.editing = { mode, event: Object.assign({}, arg), original: Object.assign({}, arg) };
     renderEditor();
     return;
   }
@@ -843,13 +1028,24 @@ function renderEditor() {
 
   document.getElementById('modalTitle').textContent = isView
     ? '日程详情（' + (ev.calendarName || '远程') + '）'
-    : (isEdit ? '编辑日程' : '新建日程');
+    : (isEdit ? (isRecurringInstance(ev) ? '编辑日程（作用于整个系列）' : '编辑日程') : '新建日程');
   document.getElementById('evTitle').value = ev.title || '';
   document.getElementById('evTitle').disabled = isView;
   document.getElementById('btnDelete').hidden = !isEdit;
   document.getElementById('btnSave').hidden = isView;
   document.getElementById('btnCancel').textContent = isView ? '关闭' : '取消';
   document.getElementById('formError').textContent = '';
+
+  // 顶部提示条：重复系列实例只能改文本（时间/全天锁定），删除=删除整体系列
+  const hint = document.getElementById('evHint');
+  if (hint) {
+    if (isEdit && isRecurringInstance(ev)) {
+      hint.textContent = '这是重复系列中的其中一次：标题与备注会应用到整个系列；如需调整某一次的时间，请到飞书客户端操作。点击删除将移除整个系列。';
+      hint.hidden = false;
+    } else {
+      hint.hidden = true;
+    }
+  }
 
   // 日历选择（仅新建模式）：本地「个人」或已导入的飞书日历
   const calRow = document.getElementById('evCalRow');
@@ -872,11 +1068,13 @@ function renderEditor() {
     calRow.hidden = true;
   }
 
-  // 只读模式下禁用全部输入
-  ['evStartDate', 'evStartTime', 'evEndDate', 'evEndTime', 'evNotes'].forEach((id) => {
-    document.getElementById(id).disabled = isView;
+  // 只读模式禁用全部输入；重复系列实例只允许修改文本字段（时间/全天锁定）
+  const lockTime = isView || (isEdit && isRecurringInstance(ev));
+  ['evStartDate', 'evStartTime', 'evEndDate', 'evEndTime'].forEach((id) => {
+    document.getElementById(id).disabled = lockTime;
   });
-  document.getElementById('evAllDay').style.pointerEvents = isView ? 'none' : '';
+  document.getElementById('evNotes').disabled = isView;
+  document.getElementById('evAllDay').style.pointerEvents = lockTime ? 'none' : '';
 
   // 全天开关
   const sw = document.getElementById('evAllDay');
@@ -889,12 +1087,12 @@ function renderEditor() {
   document.getElementById('evEndTime').value = ev.allDay ? '10:00' : (parseDT(ev.end) ? fmtTime(ev.end) : '10:00');
   document.getElementById('evNotes').value = isView
     ? (ev.location ? '地点：' + ev.location : '')
-    : (ev.notes || '');
+    : (ev.notes !== undefined ? ev.notes : (ev.description || ''));
   syncTimeVisibility();
 
-  // 颜色
+  // 颜色（本地日程可改；远程/飞书日程颜色属于日历源，不可在此修改）
   const picker = document.getElementById('evColorPicker');
-  picker.hidden = isView;
+  picker.hidden = isView || !!ev.remote;
   clear(picker);
   Object.entries(COLORS).forEach(([name, color]) => {
     const s = el('span', 'color-swatch' + (ev.color === name ? ' active' : ''));
@@ -951,8 +1149,19 @@ async function saveEditor() {
   btn.disabled = true;
   try {
     if (state.editing.mode === 'edit') {
-      // 仅本地日程可编辑（远程/飞书日程点击时为只读查看）
-      await apiSend('PUT', '/api/events/' + ev.id, ev);
+      if (ev.remote) {
+        // 飞书日历写回：重复系列实例只提交文本字段（时间由后端锁定）；普通日程携带完整字段
+        const path = '/api/calendars/' + encodeURIComponent(ev.calendarId) + '/events/' + encodeURIComponent(ev.id);
+        const body = { title: ev.title, notes: ev.notes };
+        if (!isRecurringInstance(ev)) {
+          body.start = ev.start;
+          body.end = ev.end;
+          body.allDay = ev.allDay;
+        }
+        await apiSend('PUT', path, body);
+      } else {
+        await apiSend('PUT', '/api/events/' + ev.id, ev);
+      }
     } else {
       // 新建：按下拉「日历」选择路由 —— cal:<id> 写回飞书日历，local 写入本地
       const calSel = document.getElementById('evCalendar');
@@ -975,7 +1184,16 @@ async function saveEditor() {
 async function deleteEvent() {
   const ev = state.editing.event;
   try {
-    await apiSend('DELETE', '/api/events/' + ev.id);
+    if (ev.remote) {
+      // 飞书日历写回：删除重复系列的其中一次实例 → 移除整个系列（先明确确认）
+      if (isRecurringInstance(ev)) {
+        if (!confirm('该日程为重复系列的其中一次。删除将移除整个系列在飞书上的全部日程，且无法撤销。确定删除？')) return;
+      }
+      const delId = isRecurringInstance(ev) ? ev.id.split('#')[0] : ev.id;
+      await apiSend('DELETE', '/api/calendars/' + encodeURIComponent(ev.calendarId) + '/events/' + encodeURIComponent(delId));
+    } else {
+      await apiSend('DELETE', '/api/events/' + ev.id);
+    }
     closeEditor();
     await refreshAll();
   } catch (ex) {

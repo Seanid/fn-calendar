@@ -456,6 +456,79 @@ async function feishuCreateEvent(cal, body) {
   return data.event;
 }
 
+/**
+ * 判断内部缓存 id 是否属于「重复日程的展开实例」。
+ * 展开实例 id = '{系列主event_id}#{实例起始时间戳}'（见 parseICSContent / expandFeishuSeries）；
+ * 非重复日程的缓存 id 就是飞书 event_id 本身（无 '#'）。
+ * 返回系列主 event_id；非实例返回 null。
+ */
+function feishuSeriesId(internalId) {
+  const s = String(internalId || '');
+  const i = s.indexOf('#');
+  return i > 0 ? s.slice(0, i) : null;
+}
+
+/**
+ * 更新飞书日历上的一个日程（PATCH）。
+ * 非重复日程：标题/备注/时间均可改；重复系列的展开实例：仅允许文本字段（作用于整个系列），
+ * 时间/全天字段原样保留（飞书对单实例改期需在其客户端创建「例外」，无直接 API）。
+ * 注意：飞书 PATCH 成功响应不含事件体，缓存由调用方基于本地数据回填。
+ */
+async function feishuUpdateEvent(cal, internalId, body) {
+  const seriesId = feishuSeriesId(internalId);
+  const evId = seriesId || internalId; // 请求飞书用的 event_id
+  const apiBase = '/open-apis/calendar/v4/calendars/' + encodeURIComponent(cal.feishuCalendarId) + '/events/' + encodeURIComponent(evId);
+  const cachedAllDay = loadCache(cal.id).find((e) => e.id === internalId);
+  const curAllDay = !!(cachedAllDay && cachedAllDay.allDay);
+
+  const payload = {};
+  if (body.title !== undefined && String(body.title).trim()) payload.summary = String(body.title).trim();
+  if (body.notes !== undefined) payload.description = String(body.notes || '');
+
+  if (seriesId) {
+    // 重复系列：不允许修改单次时间/全天（语义上会改变整个系列起始，容易误伤），仅文本字段更新
+    if (body.start !== undefined || body.end !== undefined || body.allDay !== undefined) {
+      throw new Error('该日程为重复日程的某次实例，暂不支持单独修改时间；如要调整请到飞书客户端操作该次日程');
+    }
+  } else {
+    // 非重复日程：时间/全天同步修改（PATCH 语义与 create 相同的时间结构）
+    if (body.allDay !== undefined && !!body.allDay !== curAllDay) {
+      throw new Error('暂不支持切换日程的全天/定时类型，请到飞书客户端操作');
+    }
+    if (body.start !== undefined || body.end !== undefined) {
+      const allDay = body.allDay !== undefined ? !!body.allDay : curAllDay;
+      const startT = allDay ? parseDate(body.start) : body.start ? new Date(body.start) : null;
+      const endT = allDay ? parseDate(body.end) : body.end ? new Date(body.end) : null;
+      if (!startT || isNaN(startT.getTime()) || !endT || isNaN(endT.getTime())) {
+        throw new Error('时间格式无效');
+      }
+      const p = (n) => String(n).padStart(2, '0');
+      if (allDay) {
+        payload.start_time = { date: `${startT.getFullYear()}-${p(startT.getMonth() + 1)}-${p(startT.getDate())}` };
+        payload.end_time = { date: `${endT.getFullYear()}-${p(endT.getMonth() + 1)}-${p(endT.getDate())}` };
+      } else {
+        payload.start_time = { timestamp: String(Math.floor(startT.getTime() / 1000)), timezone: 'Asia/Shanghai' };
+        payload.end_time = { timestamp: String(Math.floor(endT.getTime() / 1000)), timezone: 'Asia/Shanghai' };
+      }
+    }
+  }
+
+  if (!Object.keys(payload).length) return; // 无变更字段，静默成功
+  await feishuReq(apiBase, { method: 'PATCH', auth: 'user', body: payload });
+}
+
+/** 删除飞书日历上的一个日程（DELETE）。重复系列展开实例禁止单次删除。 */
+async function feishuDeleteEvent(cal, internalId) {
+  const seriesId = feishuSeriesId(internalId);
+  if (seriesId) {
+    throw new Error('该日程为重复日程的某次实例，暂不支持删除单次；可到飞书客户端删除该次或整个系列');
+  }
+  await feishuReq('/open-apis/calendar/v4/calendars/' + encodeURIComponent(cal.feishuCalendarId) + '/events/' + encodeURIComponent(internalId), {
+    method: 'DELETE',
+    auth: 'user',
+  });
+}
+
 /** 飞书 user_info（显示授权账号名） */
 async function feishuUserInfo() {
   const data = await feishuReq('/open-apis/authen/v1/user_info', { auth: 'user' });
@@ -1439,6 +1512,78 @@ function handleApi(method, segments, req, res) {
         cal.lastSync = new Date().toISOString();
         saveCalendars(list);
         return sendJson(res, 200, { event: intl });
+      }).catch((e) => sendJson(res, 400, { error: e.message }));
+    }
+
+    // PUT /api/calendars/:id/events/:eid — 修改可写日历（飞书）上的日程并同步本地缓存
+    if (method === 'PUT' && segments.length === 4 && segments[2] === 'events') {
+      const id = segments[1];
+      const eid = decodeURIComponent(segments[3]);
+      return readBody(req).then(async (body) => {
+        const list = loadCalendars();
+        const cal = list.find((c) => c.id === id);
+        if (!cal) return sendJson(res, 404, { error: 'calendar not found' });
+        if (!isWritableCalendar(cal)) {
+          return sendJson(res, 400, { error: '该日历为只读订阅，不支持修改日程' });
+        }
+        const cached = loadCache(cal.id);
+        const cachedEv = cached.find((e) => e.id === eid);
+        if (!cachedEv) return sendJson(res, 404, { error: '缓存中未找到该日程，请先同步日历' });
+        await feishuUpdateEvent(cal, eid, body);
+        const seriesId = feishuSeriesId(eid);
+        if (seriesId) {
+          // 整体系列文本更新：同步该系列全部缓存实例（各自时间保留）
+          const title = body.title !== undefined ? String(body.title).trim() : undefined;
+          const description = body.notes !== undefined ? String(body.notes || '') : undefined;
+          for (const e of cached) {
+            if (e.id === seriesId || String(e.id).indexOf(seriesId + '#') === 0) {
+              if (title !== undefined) e.title = title;
+              if (description !== undefined) e.description = description;
+            }
+          }
+        } else {
+          const updated = Object.assign({}, cachedEv);
+          if (body.title !== undefined) updated.title = String(body.title).trim();
+          if (body.notes !== undefined) updated.description = String(body.notes || '');
+          if (body.start !== undefined) updated.start = body.start;
+          if (body.end !== undefined) updated.end = body.end;
+          if (body.allDay !== undefined) updated.allDay = !!body.allDay;
+          const i = cached.findIndex((e) => e.id === eid);
+          if (i >= 0) cached[i] = updated;
+        }
+        saveCache(cal.id, cached);
+        cal.eventCount = cached.length;
+        cal.lastSync = new Date().toISOString();
+        saveCalendars(list);
+        const updated = cached.find((e) => e.id === eid) || cachedEv;
+        return sendJson(res, 200, { event: updated });
+      }).catch((e) => sendJson(res, 400, { error: e.message }));
+    }
+
+    // DELETE /api/calendars/:id/events/:eid — 删除可写日历（飞书）上的日程并同步本地缓存
+    if (method === 'DELETE' && segments.length === 4 && segments[2] === 'events') {
+      const id = segments[1];
+      const eid = decodeURIComponent(segments[3]);
+      return Promise.resolve().then(async () => {
+        const list = loadCalendars();
+        const cal = list.find((c) => c.id === id);
+        if (!cal) return sendJson(res, 404, { error: 'calendar not found' });
+        if (!isWritableCalendar(cal)) {
+          return sendJson(res, 400, { error: '该日历为只读订阅，不支持删除日程' });
+        }
+        const cached = loadCache(cal.id);
+        // 命中条件：精确 id，或系列主 id（删除整个系列时需连带全部展开实例）
+        const hit = cached.some((e) => e.id === eid || String(e.id).indexOf(eid + '#') === 0);
+        if (!hit) {
+          return sendJson(res, 404, { error: '缓存中未找到该日程，请先同步日历' });
+        }
+        await feishuDeleteEvent(cal, eid);
+        const rest = cached.filter((e) => e.id !== eid && String(e.id).indexOf(eid + '#') !== 0);
+        saveCache(cal.id, rest);
+        cal.eventCount = rest.length;
+        cal.lastSync = new Date().toISOString();
+        saveCalendars(list);
+        return sendJson(res, 200, { ok: true });
       }).catch((e) => sendJson(res, 400, { error: e.message }));
     }
 
