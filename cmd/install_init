@@ -1,0 +1,3 @@
+#!/bin/bash
+# fn-calendar 安装前钩子
+exit 0

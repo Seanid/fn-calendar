@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>日历</title>
+  <link rel="icon" href="images/icon_64.png" type="image/png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <!-- 顶部工具栏 -->
+    <header class="toolbar">
+      <div class="toolbar-left">
+        <button id="btnCreate" class="btn btn-primary" title="新建日程 (双击日历空白处也可创建)">＋ 新建</button>
+        <button id="btnToday" class="btn">今天</button>
+        <div class="nav-group">
+          <button id="btnPrev" class="nav-btn" title="上一个">‹</button>
+          <button id="btnNext" class="nav-btn" title="下一个">›</button>
+          <h2 id="viewTitle" class="view-title">2026年9月</h2>
+        </div>
+      </div>
+      <div class="toolbar-right">
+        <div class="segmented" id="viewSwitcher">
+          <button data-view="year" title="年视图">年</button>
+          <button data-view="month" class="active" title="月视图">月</button>
+          <button data-view="week" title="周视图">周</button>
+          <button data-view="day" title="日视图">日</button>
+        </div>
+      </div>
+    </header>
+
+    <div class="content">
+      <!-- 左侧边栏 -->
+      <aside class="sidebar">
+        <div class="today-card">
+          <div class="today-date">
+            <span class="today-daynum" id="todayDayNum">17</span>
+            <div class="today-meta">
+              <div class="today-ym" id="todayYmd">2026年9月17日 周四</div>
+              <div class="today-lunar" id="todayLunar">农历八月初七</div>
+            </div>
+          </div>
+          <div class="today-tags" id="todayTags"></div>
+          <div class="today-ganzhi" id="todayGanzhi"></div>
+        </div>
+
+        <div class="mini-calendar" id="miniCalendar"></div>
+
+        <div class="sidebar-divider"></div>
+        <div class="list-header">
+          <span>我的日历</span>
+          <button id="btnAddList" title="添加日历">＋</button>
+        </div>
+        <div class="calendar-list">
+          <label class="cal-item checked">
+            <input type="checkbox" checked>
+            <span class="color-dot" style="background:#1e88e5"></span>
+            <span class="cal-name">个人</span>
+            <span class="cal-count" id="calCount">0</span>
+          </label>
+          <div id="remoteCalList"></div>
+        </div>
+      </aside>
+
+      <!-- 主区域 -->
+      <main class="main-area" id="mainArea"></main>
+    </div>
+  </div>
+
+  <!-- 日程编辑弹窗 -->
+  <div class="modal-mask" id="modalMask" hidden>
+    <div class="modal">
+      <div class="modal-titlebar">
+        <span id="modalTitle">新建日程</span>
+        <button class="modal-close" id="btnModalClose" title="关闭">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-row">
+          <input type="text" id="evTitle" class="input-title" placeholder="标题" maxlength="120">
+        </div>
+        <div class="form-row">
+          <label class="switch-row"><span>全天</span>
+            <span class="switch" id="evAllDay"><span class="switch-knob"></span></span>
+          </label>
+        </div>
+        <div class="form-row form-grid">
+          <label class="form-label">开始</label>
+          <input type="date" id="evStartDate" class="input input-date">
+          <input type="time" id="evStartTime" class="input input-time" value="09:00">
+        </div>
+        <div class="form-row form-grid">
+          <label class="form-label">结束</label>
+          <input type="date" id="evEndDate" class="input input-date">
+          <input type="time" id="evEndTime" class="input input-time" value="10:00">
+        </div>
+        <div class="form-row form-grid">
+          <label class="form-label">颜色</label>
+          <div class="color-picker span2" id="evColorPicker"></div>
+        </div>
+        <div class="form-row">
+          <label class="form-label">备注</label>
+          <textarea id="evNotes" class="input input-notes" rows="3" placeholder="添加备注…"></textarea>
+        </div>
+        <div class="form-error" id="formError"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="btnDelete" class="btn btn-danger" hidden>删除</button>
+        <div class="footer-right">
+          <button id="btnCancel" class="btn">取消</button>
+          <button id="btnSave" class="btn btn-primary">保存</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 添加日历源弹窗（CalDAV / ICS 订阅） -->
+  <div class="modal-mask" id="calModalMask" hidden>
+    <div class="modal modal-cal">
+      <div class="modal-titlebar">
+        <span id="calModalTitle">添加日历</span>
+        <button class="modal-close" id="btnCalModalClose" title="关闭">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-row">
+          <label class="form-label">名称</label>
+          <input type="text" id="calName" class="input" placeholder="如：节假日、公司日历" maxlength="60">
+        </div>
+          <div class="form-row form-grid">
+            <label class="form-label">类型</label>
+            <div class="segmented cal-type span2" id="calTypeSwitcher">
+              <button data-type="ics" class="active" title="公开订阅链接（.ics 文件）">公开订阅</button>
+              <button data-type="caldav" title="私有 CalDAV 服务器">私有 CalDAV</button>
+            </div>
+          </div>
+        <div class="form-row">
+          <label class="form-label">地址</label>
+          <input type="text" id="calUrl" class="input" placeholder="公开订阅：…/xxx.ics　CalDAV：服务器根地址" spellcheck="false">
+        </div>
+        <div class="form-row form-grid" id="calAuthRow" hidden>
+          <label class="form-label">账号</label>
+          <input type="text" id="calUsername" class="input" placeholder="用户名" autocomplete="off">
+          <input type="password" id="calPassword" class="input" placeholder="密码 / 应用专用密码" autocomplete="new-password">
+        </div>
+        <div class="form-row form-grid">
+          <label class="form-label">颜色</label>
+          <div class="color-picker span2" id="calColorPicker"></div>
+        </div>
+        <div class="cal-hint" id="calHint">公开订阅：粘贴 iCalendar（.ics）订阅链接。私有 CalDAV：输入服务器地址（如 https://caldav.feishu.cn，支持自动发现日历）及账号密码；凭据仅保存在本机。</div>
+        <div class="cal-meta" id="calMeta" hidden>
+          <div>已缓存 <b id="calMetaCount">0</b> 个日程 · 上次同步 <span id="calMetaSync">从未</span></div>
+          <div class="cal-meta-err" id="calMetaErr" hidden></div>
+        </div>
+        <div class="form-error" id="calError"></div>
+      </div>
+      <div class="modal-footer">
+        <div class="footer-right">
+          <button id="btnCalCancel" class="btn">取消</button>
+          <button id="btnCalSave" class="btn btn-primary">添加</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

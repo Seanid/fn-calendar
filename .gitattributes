@@ -1,0 +1,17 @@
+# 强制 LF：shell 脚本 / 服务端 JS / 清单在 fnOS(Linux) 上执行，CRLF 会导致 shebang 失效
+* text=auto
+
+cmd/*        text eol=lf
+app/server/* text eol=lf
+app/ui/*     text eol=lf
+manifest     text eol=lf
+config/*     text eol=lf
+*.sh         text eol=lf
+.gitignore   text eol=lf
+.gitattributes text eol=lf
+
+# 二进制文件不做文本转换
+*.fpk binary
+*.png binary
+ICON.PNG binary
+ICON_256.PNG binary

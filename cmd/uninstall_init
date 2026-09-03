@@ -1,0 +1,3 @@
+#!/bin/bash
+# fn-calendar 卸载前钩子
+exit 0

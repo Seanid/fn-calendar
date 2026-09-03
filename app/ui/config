@@ -1,0 +1,15 @@
+{
+  ".url": {
+    "fn-calendar.main": {
+      "title": "日历",
+      "desc": "macOS 风格日历，支持农历与日程管理",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewaySocket": "fn-calendar.sock",
+      "gatewayPrefix": "/app/fn-calendar",
+      "url": "/app/fn-calendar",
+      "allUsers": true
+    }
+  }
+}

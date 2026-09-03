@@ -1,0 +1,3 @@
+#!/bin/bash
+# fn-calendar 安装后钩子
+exit 0

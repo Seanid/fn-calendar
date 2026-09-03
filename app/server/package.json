@@ -1,0 +1,11 @@
+{
+  "name": "fn-calendar-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "fn-calendar Node.js 后端服务",
+  "main": "server.js",
+  "dependencies": {
+    "lunar-javascript": "^1.7.7",
+    "node-ical": "^0.27.1"
+  }
+}

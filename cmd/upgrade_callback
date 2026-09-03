@@ -1,0 +1,3 @@
+#!/bin/bash
+# fn-calendar 升级后钩子
+exit 0

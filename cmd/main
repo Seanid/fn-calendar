@@ -1,0 +1,72 @@
+#!/bin/bash
+# fn-calendar 应用生命周期脚本
+
+SERVER_DIR="${TRIM_APPDEST}/server"
+NODE_BIN="${SERVER_DIR}/node"
+SERVER_JS="${SERVER_DIR}/server.js"
+GATEWAY_SOCKET="${TRIM_APPDEST}/fn-calendar.sock"
+LOG_FILE="${TRIM_PKGVAR}/app.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+
+start() {
+    # 清理可能残留的旧 Socket，避免绑定失败
+    rm -f "${GATEWAY_SOCKET}" 2>/dev/null || true
+    (
+        export FNNAS_GATEWAY_SOCKET="${GATEWAY_SOCKET}"
+        export FNNAS_GATEWAY_PREFIX="/app/fn-calendar"
+        export UI_DIR="${TRIM_APPDEST}/ui"
+        export DATA_DIR="${TRIM_PKGVAR}"
+        export HOME="${TRIM_PKGHOME}"
+        exec "${NODE_BIN}" "${SERVER_JS}"
+    ) >> "${LOG_FILE}" 2>&1 &
+    echo $! > "${PID_FILE}"
+    exit 0
+}
+
+stop() {
+    if [ -f "${PID_FILE}" ]; then
+        pid=$(cat "${PID_FILE}" | tr -d '[:space:]')
+        if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+            kill "${pid}" 2>/dev/null
+            for i in 1 2 3 4 5; do
+                kill -0 "${pid}" 2>/dev/null || break
+                sleep 1
+            done
+            kill -9 "${pid}" 2>/dev/null || true
+        fi
+        rm -f "${PID_FILE}"
+    fi
+    rm -f "${GATEWAY_SOCKET}" 2>/dev/null || true
+    exit 0
+}
+
+status() {
+    if [ -f "${PID_FILE}" ]; then
+        pid=$(cat "${PID_FILE}" | tr -d '[:space:]')
+        if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+            exit 0
+        fi
+        rm -f "${PID_FILE}"
+    fi
+    exit 3
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    status)
+        status
+        ;;
+    restart)
+        stop
+        sleep 1
+        start
+        ;;
+    *)
+        exit 1
+        ;;
+esac
