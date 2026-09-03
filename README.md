@@ -14,7 +14,7 @@
 
 ## 安装
 
-1. 将 `fn-calendar/fn-calendar.fpk` 拷贝到能访问飞牛 NAS 的电脑上
+1. 将本仓库根目录下的 `fn-calendar.fpk` 安装包拷贝到能访问飞牛 NAS 的电脑上
 2. 打开飞牛网页端：**应用中心 → 设置（右上角齿轮）→ 手动安装**
 3. 选择 `fn-calendar.fpk`，确认安装
 4. 安装完成后，桌面会出现「日历」图标，点击即可在当前页面使用
@@ -52,9 +52,12 @@ fn-calendar/
     │   └── images/       # 图标
     └── server/
         ├── server.js     # Node 后端（HTTP + API + 静态文件）
-        ├── node          # Linux x64 Node.js v22 运行时
-        ├── package.json  # 依赖 lunar-javascript
-        └── node_modules/
+        ├── package.json  # 依赖（node-ical / lunar-javascript）
+        └── package-lock.json
+
+> 打包进 fpk 但**不入 git 仓库**的部件：`app/server/node`（Linux x64 Node.js v22 运行时，约 116MB，
+> 超出 GitHub 100MB 单文件限制）与 `app/server/node_modules/`（`npm ci` 可重建）。
+> 重新打包前需自行准备，见下节「重新打包」。
 ```
 
 ## 后端 API
@@ -84,7 +87,21 @@ fn-calendar/
 
 ## 重新打包
 
-```bash
-cd fn-calendar
-node ../tools/runfnpack.mjs build   # 生成 fn-calendar.fpk
-```
+仓库根目录已附带当前版本安装包 `fn-calendar.fpk`（可直接安装）。若修改代码后需要重新打包：
+
+1. **准备运行时**（仓库不含）：将 Linux x64 的 Node.js v22 二进制放到 `app/server/node` 并赋予执行位
+   ```bash
+   chmod +x app/server/node
+   ```
+
+2. **安装后端依赖**（node-ical / lunar-javascript）：
+   ```bash
+   cd app/server && npm ci && cd ..
+   ```
+
+3. **用飞牛官方 fpk 工具打包**（`fnpack` 从飞牛开发者文档 / SDK 获取，本机开发使用 Windows 版 `fnpack.exe`）：
+   ```bash
+   fnpack build    # 在仓库根目录执行，产物：fn-calendar.fpk
+   ```
+
+> 发版约定：修改代码后同步递增 `manifest` 中的 `version` 并追加 `changelog`，重新生成安装包后连同源码一并提交。
