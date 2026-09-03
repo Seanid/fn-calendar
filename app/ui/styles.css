@@ -1043,3 +1043,59 @@ body {
 }
 .cal-meta b { color: var(--text); }
 .cal-meta-err { color: var(--today-red); margin-top: 2px; word-break: break-all; }
+
+/* ============ 飞书日历（OAuth 授权接入） ============ */
+.cal-feishu {
+  background: rgba(0, 0, 0, 0.025);
+  border-radius: 8px;
+  padding: 10px;
+  margin-top: 2px;
+}
+.feishu-conn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.feishu-status { font-size: 13px; line-height: 1.5; min-width: 0; }
+.feishu-status b { font-weight: 600; }
+.feishu-status .st-ok { color: #2e9e44; }
+.feishu-status .st-err { color: #d93025; }
+.feishu-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.feishu-actions .btn { font-size: 12px; padding: 4px 10px; }
+.feishu-app-config { margin-top: 8px; }
+.feishu-app-config .form-row { margin-bottom: 8px; }
+.feishu-app-config .input { min-width: 0; flex: 1; }
+.feishu-tip {
+  font-size: 12px; color: var(--text-dim); line-height: 1.6;
+  background: rgba(250, 173, 20, 0.08);
+  border-radius: 6px; padding: 8px 10px; margin-top: 8px;
+}
+.feishu-tip.tip-err { background: rgba(217, 48, 37, 0.06); color: #b3261e; }
+.feishu-cal-list {
+  margin-top: 8px; max-height: 190px; overflow-y: auto;
+  border: 1px solid rgba(0, 0, 0, 0.08); border-radius: 8px;
+  padding: 2px 10px; background: #fff;
+}
+.feishu-cal-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 2px; font-size: 13px; border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+}
+.feishu-cal-item:last-child { border-bottom: none; }
+.feishu-cal-item input { accent-color: var(--accent, #1e88e5); }
+.feishu-cal-item .fc-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.feishu-cal-item .fc-role {
+  font-size: 11px; color: var(--text-dim); border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 10px; padding: 0 7px; line-height: 18px; flex-shrink: 0;
+}
+.feishu-redirect {
+  font-size: 12px; color: var(--text-dim); line-height: 1.7;
+  background: rgba(0, 0, 0, 0.03); border-radius: 6px; padding: 8px 10px; margin-top: 8px;
+}
+.feishu-redirect code {
+  display: block; word-break: break-all; font-size: 11px;
+  background: rgba(0, 0, 0, 0.06); border-radius: 4px; padding: 3px 6px; margin-top: 4px;
+}
+
+/* 新建日程弹窗：日历选择下拉 */
+.ev-cal-select { min-width: 0; height: 34px; }

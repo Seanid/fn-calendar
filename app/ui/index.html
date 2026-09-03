@@ -79,6 +79,10 @@
         <div class="form-row">
           <input type="text" id="evTitle" class="input-title" placeholder="标题" maxlength="120">
         </div>
+        <div class="form-row form-grid" id="evCalRow">
+          <label class="form-label">日历</label>
+          <select id="evCalendar" class="input ev-cal-select span2"></select>
+        </div>
         <div class="form-row">
           <label class="switch-row"><span>全天</span>
             <span class="switch" id="evAllDay"><span class="switch-knob"></span></span>
@@ -131,9 +135,36 @@
             <div class="segmented cal-type span2" id="calTypeSwitcher">
               <button data-type="ics" class="active" title="公开订阅链接（.ics 文件）">公开订阅</button>
               <button data-type="caldav" title="私有 CalDAV 服务器">私有 CalDAV</button>
+              <button data-type="feishu" title="通过飞书开放平台 OAuth 授权接入">飞书日历</button>
             </div>
           </div>
-        <div class="form-row">
+        <!-- 飞书：连接/授权/日历导入面板 -->
+        <div class="cal-feishu" id="calFeishuPanel" hidden>
+          <div class="feishu-conn">
+            <div class="feishu-status" id="feishuStatus">未连接</div>
+            <div class="feishu-actions">
+              <button class="btn" id="btnFeishuAuthorize" hidden>授权飞书</button>
+              <button class="btn" id="btnFeishuRefresh" hidden>刷新日历列表</button>
+            </div>
+          </div>
+          <div class="feishu-app-config" id="feishuAppConfig" hidden>
+            <div class="form-row form-grid">
+              <label class="form-label">App ID</label>
+              <input type="text" id="feishuAppId" class="input" placeholder="cli_xxxxxxxxxxxx" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="form-row form-grid">
+              <label class="form-label">App Secret</label>
+              <input type="password" id="feishuAppSecret" class="input" placeholder="应用密钥" autocomplete="new-password">
+            </div>
+            <button class="btn btn-primary" id="btnFeishuSaveApp">保存凭证</button>
+          </div>
+          <div class="feishu-tip" id="feishuTip" hidden></div>
+          <div class="feishu-cal-list" id="feishuCalList" hidden></div>
+          <div class="feishu-redirect" id="feishuRedirect" hidden>
+            请先在飞书开放平台（应用 → 安全设置 → 重定向 URL）登记：<code id="feishuRedirectUri"></code>
+          </div>
+        </div>
+        <div class="form-row" id="calUrlRow">
           <label class="form-label">地址</label>
           <input type="text" id="calUrl" class="input" placeholder="公开订阅：…/xxx.ics　CalDAV：服务器根地址" spellcheck="false">
         </div>
@@ -142,7 +173,7 @@
           <input type="text" id="calUsername" class="input" placeholder="用户名" autocomplete="off">
           <input type="password" id="calPassword" class="input" placeholder="密码 / 应用专用密码" autocomplete="new-password">
         </div>
-        <div class="form-row form-grid">
+        <div class="form-row form-grid" id="calColorRow">
           <label class="form-label">颜色</label>
           <div class="color-picker span2" id="calColorPicker"></div>
         </div>

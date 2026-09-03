@@ -27,6 +27,7 @@ const UI_DIR = process.env.UI_DIR || path.join(__dirname, '..', 'ui');
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'var');
 const EVENTS_FILE = path.join(DATA_DIR, 'events.json');
 const CALENDARS_FILE = path.join(DATA_DIR, 'calendars.json');
+const FEISHU_FILE = path.join(DATA_DIR, 'feishu.json');
 const CACHE_DIR = path.join(DATA_DIR, 'cache');
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
@@ -83,6 +84,391 @@ function saveCalendars(list) {
   } catch (e) {
     console.error('[fn-calendar] 保存日历源失败:', e.message);
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* 飞书日历（OAuth 授权 + 开放平台 API）                                */
+/* ------------------------------------------------------------------ */
+
+// 允许通过环境变量覆盖飞书接口地址（主要用于本地/离线联调与自动化测试；默认指向线上）
+const FEISHU_BASE = process.env.FEISHU_BASE || 'https://open.feishu.cn';
+const FEISHU_AUTH = process.env.FEISHU_AUTH || 'https://accounts.feishu.cn/open-apis/authen/v1/authorize';
+
+let _appTokenCache = { token: '', expiresAt: 0 };
+
+/** 读取飞书连接配置（appId/appSecret + 授权后的 user token） */
+function loadFeishu() {
+  try {
+    if (fs.existsSync(FEISHU_FILE)) {
+      return JSON.parse(fs.readFileSync(FEISHU_FILE, 'utf8')) || {};
+    }
+  } catch (e) {
+    console.error('[fn-calendar] 读取飞书配置失败:', e.message);
+  }
+  return {};
+}
+
+function saveFeishu(cfg) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const tmp = FEISHU_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2), 'utf8');
+    fs.renameSync(tmp, FEISHU_FILE);
+  } catch (e) {
+    console.error('[fn-calendar] 保存飞书配置失败:', e.message);
+  }
+}
+
+/** 请求飞书开放平台 JSON 接口；成功时返回 data，失败抛中文错误 */
+async function feishuReq(apiPath, opts) {
+  const o = opts || {};
+  const headers = { 'Content-Type': 'application/json; charset=utf-8' };
+  if (o.auth === 'user') headers['Authorization'] = 'Bearer ' + (await feishuUserToken());
+  else if (o.auth === 'app') headers['Authorization'] = 'Bearer ' + (await feishuAppToken());
+
+  const timeout = new AbortController();
+  const timer = setTimeout(() => timeout.abort(), 20000);
+  let resp;
+  try {
+    resp = await fetch(FEISHU_BASE + apiPath, {
+      method: o.method || 'GET',
+      headers,
+      body: o.body ? JSON.stringify(o.body) : undefined,
+      signal: timeout.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    if (e.name === 'AbortError') throw new Error('请求飞书超时（20 秒）');
+    throw new Error('无法连接飞书服务器：' + e.message);
+  }
+  clearTimeout(timer);
+
+  let json = null;
+  try { json = await resp.json(); } catch (e) { /* 非 JSON */ }
+  if (!json || typeof json.code !== 'number') {
+    throw new Error('飞书服务器响应异常（HTTP ' + resp.status + '）');
+  }
+  if (json.code !== 0) {
+    const msg = json.msg || ('错误码 ' + json.code);
+    // token 失效/过期：尝试刷新一次后重放
+    if (o.auth === 'user' && o.retry !== false && /token/i.test(msg)) {
+      try {
+        await feishuRefreshToken();
+        return feishuReq(apiPath, Object.assign({}, o, { retry: false }));
+      } catch (e) { /* 刷新失败则抛原始错误 */ }
+    }
+    throw new Error('飞书接口错误：' + msg);
+  }
+  // 多数接口返回 { code, data }；少数（如 app_access_token/internal）把字段直接放在顶层
+  return (json.data !== undefined) ? json.data : json;
+}
+
+/** app_access_token（自建应用凭证，缓存至过期） */
+async function feishuAppToken() {
+  const cfg = loadFeishu();
+  if (!cfg.appId || !cfg.appSecret) throw new Error('尚未配置飞书应用凭证');
+  if (_appTokenCache.token && _appTokenCache.expiresAt > Date.now() + 60000) {
+    return _appTokenCache.token;
+  }
+  const data = await feishuReq('/open-apis/auth/v3/app_access_token/internal', {
+    method: 'POST',
+    auth: 'none',
+    body: { app_id: cfg.appId, app_secret: cfg.appSecret },
+  });
+  _appTokenCache = { token: data.app_access_token, expiresAt: Date.now() + (data.expire || 7200) * 1000 };
+  return data.app_access_token;
+}
+
+/** user_access_token：未过期直接用，将过期则用 refresh_token 刷新 */
+async function feishuUserToken() {
+  const cfg = loadFeishu();
+  if (!cfg.accessToken) throw new Error('尚未授权飞书账号');
+  if (cfg.tokenExpiresAt && cfg.tokenExpiresAt > Date.now() + 120000) return cfg.accessToken;
+  if (cfg.refreshToken) {
+    try { return await feishuRefreshToken(); } catch (e) { /* 继续用旧 token 尝试 */ }
+  }
+  return cfg.accessToken;
+}
+
+/** 用 refresh_token 换新 user token */
+async function feishuRefreshToken() {
+  const cfg = loadFeishu();
+  if (!cfg.refreshToken) throw new Error('缺少 refresh_token，请重新授权');
+  const data = await feishuReq('/open-apis/authen/v1/oidc/refresh_access_token', {
+    method: 'POST',
+    auth: 'app',
+    body: { grant_type: 'refresh_token', refresh_token: cfg.refreshToken },
+  });
+  cfg.accessToken = data.access_token;
+  cfg.refreshToken = data.refresh_token;
+  cfg.tokenExpiresAt = Date.now() + (data.expires_in || 7200) * 1000;
+  saveFeishu(cfg);
+  return cfg.accessToken;
+}
+
+/** 生成飞书 OAuth 授权链接（含回调地址与随机 state） */
+function feishuAuthUrl(cfg, req) {
+  const host = req.headers['host'] || 'localhost';
+  const proto = req.headers['x-forwarded-proto'] || 'http';
+  const redirectUri = proto + '://' + host + GATEWAY_PREFIX + '/feishu/oauth/callback';
+  cfg.pendingState = crypto.randomBytes(16).toString('hex');
+  saveFeishu(cfg);
+  const q = new URLSearchParams({
+    app_id: cfg.appId,
+    redirect_uri: redirectUri,
+    scope: 'calendar:calendar',
+    state: cfg.pendingState,
+  });
+  return { url: FEISHU_AUTH + '?' + q.toString(), redirectUri };
+}
+
+/** 换取日历读写权限所需 scope 说明（引导文案用） */
+const FEISHU_SCOPE_HINT =
+  '请确认飞书开放平台应用已开通权限 calendar:calendar（读写）并发布版本；' +
+  '在「安全设置 → 重定向 URL」中登记上方回调地址（与授权弹窗中一致）。';
+
+/** 拉取当前授权用户可访问的日历列表（含 role/权限） */
+async function feishuListCalendars() {
+  const out = [];
+  let pageToken = '';
+  for (let guard = 0; guard < 20; guard++) {
+    const q = new URLSearchParams({ page_size: '50' });
+    if (pageToken) q.set('page_token', pageToken);
+    const data = await feishuReq('/open-apis/calendar/v4/calendars?' + q.toString(), { auth: 'user' });
+    for (const cal of data.calendar_list || []) {
+      out.push({
+        calendarId: cal.calendar_id,
+        summary: cal.summary || '(未命名日历)',
+        role: cal.role || 'unknown',
+        color: cal.color || '',
+      });
+    }
+    if (data.has_more && data.page_token) pageToken = data.page_token;
+    else break;
+  }
+  return out;
+}
+
+/** 飞书日程 JSON → 内部事件（沿用远端 cache 事件结构） */
+function feishuEventToInternal(ev, fid, cname, ccolor) {
+  const startRaw = (ev.start_time || {});
+  const endRaw = (ev.end_time || {});
+  const allDay = !!ev.is_all_day || (!!startRaw.date && !startRaw.timestamp);
+  const fmt = (ts) => {
+    const d = new Date(ts * 1000);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+  };
+  const start = startRaw.timestamp ? fmt(Number(startRaw.timestamp)) : (startRaw.date || '');
+  // 全天：飞书 date 结束日期含当天（内部 end 为最后一天，直接沿用）；非全天用 timestamp
+  const end = allDay
+    ? (endRaw.date || startRaw.date || start)
+    : (endRaw.timestamp ? fmt(Number(endRaw.timestamp)) : start);
+  return {
+    id: ev.event_id + (ev.recurring_event_id && ev.recurring_event_id !== ev.event_id ? '@' + ev.event_id : ''),
+    title: ev.summary && String(ev.summary).trim() ? String(ev.summary) : '（无标题）',
+    start,
+    end,
+    allDay,
+    location: (ev.location && ev.location.name) ? String(ev.location.name) : '',
+    description: ev.description || '',
+    remote: true,
+    calendarId: fid,
+    calendarName: cname,
+    calendarColor: ccolor,
+  };
+}
+
+/** 飞书日历事件列表拉取 → 内部事件数组（含循环日程 RRULE 展开与例外替换） */
+async function fetchFeishuEvents(cal, from, to) {
+  const list = await feishuApiEvents(cal.feishuCalendarId, from, to);
+  const out = [];       // 最终内部事件
+  const seriesMeta = []; // { fe } 循环系列主事件（含 recurrence）
+  const single = [];     // 单次事件（非系列、非系列派生实例）
+  const removeKeys = new Set(); // 被删除/取消实例的“原时间”（分钟粒度），用于从系列展开结果中剔除
+
+  /**
+   * 记录一个需从系列展开中剔除的原时间。
+   * 飞书把「循环日程的某个实例被删除」表示为 status=cancelled 的例外项，
+   * 其原时间可从 event_id 尾部 `_{original_time}` 解析；解析不到时退化为用 start_time 定位。
+   */
+  const addRemoveKey = (fe) => {
+    let ori = 0;
+    const m = /_(\d{9,11})$/.exec(fe.event_id || '');
+    if (m) ori = Number(m[1]);
+    if (!ori && fe.start_time && fe.start_time.timestamp) ori = Number(fe.start_time.timestamp);
+    if (ori && ori > 100000000) removeKeys.add('ts' + Math.floor(ori / 1000 / 60));
+  };
+
+  for (const fe of list) {
+    // status === 'cancelled'（注意飞书写 cancelled）：日程已被删除。
+    // 被删的普通日程只剩空标题的时间占位；被删的系列主事件不应再展开；
+    // 被删的系列单次实例（例外）只用于把该次实例从展开结果中剔除，都不再展示。
+    if (fe.status === 'cancelled') {
+      if (fe.recurring_event_id || fe.is_exception) addRemoveKey(fe);
+      continue;
+    }
+    // recurring_event_id 存在且无 recurrence → 是系列在窗口内的派生实例快照（无独立时间信息用于完整展开），跳过
+    if (fe.recurring_event_id && !fe.recurrence) continue;
+    if (fe.recurrence) seriesMeta.push(fe);
+    else single.push(fe);
+  }
+
+  // 1) 循环系列：展开为窗口内实例
+  for (const fe of seriesMeta) {
+    const base = feishuEventToInternal(fe, cal.id, cal.name, cal.color);
+    out.push(...expandFeishuSeries(base, fe, from, to));
+  }
+
+  // 2) 例外实例（exceptions）：优先级最高——展开结果中与例外原时间冲突的实例移除，以例外为准；
+  //    status=cancelled 的例外表示该次实例被删除（飞书会清空标题），只剔除实例、不补回占位。
+  const overrideEvs = [];
+  for (const fe of seriesMeta) {
+    for (const ex of (fe.exceptions || [])) {
+      const ori = ex.original_time ? Number((ex.original_time.timestamp) || 0) : 0;
+      if (ori) removeKeys.add('ts' + Math.floor(ori / 1000 / 60)); // 分钟粒度匹配
+      if (ex.status === 'cancelled') continue; // 删除实例：仅剔除，不再生成事件
+      const base = feishuEventToInternal(ex, cal.id, cal.name, cal.color);
+      if (!base.title || base.title === '（无标题）') base.title = fe.summary || '（无标题）';
+      overrideEvs.push(base);
+    }
+  }
+  if (removeKeys.size) {
+    for (let i = out.length - 1; i >= 0; i--) {
+      const s = out[i].allDay ? (parseDate(out[i].start) || new Date(NaN)).getTime() : new Date(out[i].start).getTime();
+      if (!isNaN(s) && removeKeys.has('ts' + Math.floor(s / 1000 / 60))) out.splice(i, 1);
+    }
+  }
+  out.push(...overrideEvs);
+
+  // 3) 单次事件（含非循环 standalone 与可能的主日历单次实例）
+  for (const fe of single) out.push(feishuEventToInternal(fe, cal.id, cal.name, cal.color));
+
+  // 按 id 去重（例外 override 与系列展开结果可能产生同 id 事件）
+  const seen = new Set();
+  return out.filter((e) => (seen.has(e.id) ? false : (seen.add(e.id), true)));
+}
+
+/** 分页拉取飞书日历时间窗内全部事件（REST 原语） */
+async function feishuApiEvents(calendarId, from, to) {
+  const out = [];
+  let pageToken = '';
+  const q = new URLSearchParams({
+    start_time: String(Math.floor(from.getTime() / 1000)),
+    end_time: String(Math.floor(to.getTime() / 1000)),
+    page_size: '500',
+  });
+  for (let guard = 0; guard < 50; guard++) {
+    if (pageToken) q.set('page_token', pageToken);
+    const data = await feishuReq('/open-apis/calendar/v4/calendars/' + encodeURIComponent(calendarId) + '/events?' + q.toString(), { auth: 'user' });
+    for (const it of data.items || []) out.push(it);
+    if (data.has_more && data.page_token) pageToken = data.page_token;
+    else break;
+  }
+  return out;
+}
+
+/**
+ * 展开飞书循环系列为窗口内实例：把系列转成单个 VEVENT 文本，
+ * 复用 node-ical（parseICSContent）的 RRULE 展开 + 全天语义 + 时间窗过滤。
+ */
+function expandFeishuSeries(seriesEv, fe, from, to) {
+  const startDate = seriesEv.allDay ? parseDate(seriesEv.start) : new Date(seriesEv.start);
+  const endDate = seriesEv.allDay ? parseDate(seriesEv.end) : new Date(seriesEv.end);
+  if (!startDate || isNaN(startDate.getTime()) || !endDate || isNaN(endDate.getTime())) return [seriesEv];
+
+  const rrule = String(fe.recurrence || '').replace(/\\n/g, '\n').trim();
+  let vevent = '';
+  try {
+    // 非全天用 UTC（'Z'）：node-ical 对 Z 时区解析与 RRULE 展开最成熟；
+    // 中国无夏令时，UTC 展开不会造成实例时间漂移，parseICSContent 输出时会转回本地时区。
+    const p = (n) => String(n).padStart(2, '0');
+    const dtUtc = (d) => `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}T${p(d.getUTCHours())}${p(d.getUTCMinutes())}00Z`;
+    const dtDate = (d) => `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`;
+    const esc = (s) => String(s || '').replace(/\\/g, '\\\\').replace(/\r?\n/g, '\\n').replace(/;/g, '\\;').replace(/,/g, '\\,');
+    const endRaw = seriesEv.allDay ? new Date(endDate.getTime() + 24 * 3600 * 1000) : endDate; // ICS 全天 DTEND 排他
+    const parts = [
+      'BEGIN:VEVENT',
+      'UID:' + fe.event_id,
+      'DTSTAMP:19700101T000000Z',
+      'SUMMARY:' + esc(seriesEv.title),
+      (seriesEv.allDay ? 'DTSTART;VALUE=DATE:' + dtDate(startDate) : 'DTSTART:' + dtUtc(startDate)),
+      (seriesEv.allDay ? 'DTEND;VALUE=DATE:' + dtDate(endRaw) : 'DTEND:' + dtUtc(endRaw)),
+    ];
+    // RRULE 是属性值而非 TEXT：逗号/分号不可转义（转义会被 rrule 解析为字面符导致 FREQ 无效）
+    if (rrule) parts.push('RRULE:' + rrule);
+    parts.push('END:VEVENT');
+    vevent = parts.join('\r\n');
+  } catch (e) {
+    return [seriesEv];
+  }
+
+  let expanded;
+  try {
+    expanded = parseICSContent(vevent);
+  } catch (e) {
+    return [seriesEv];
+  }
+  // parseICSContent 展开窗口为内置（过去2年~未来3年），此处按调用方时间窗再次收窄
+  const fMs = from.getTime(), tMs = to.getTime();
+  expanded = expanded.filter((x) => {
+    const s = x.allDay ? (parseDate(x.start) || new Date(NaN)) : new Date(x.start);
+    return !isNaN(s.getTime()) && s.getTime() >= fMs && s.getTime() < tMs;
+  });
+  return expanded.map((x) => Object.assign({}, x, {
+    remote: true,
+    calendarId: seriesEv.calendarId,
+    calendarName: seriesEv.calendarName,
+    calendarColor: seriesEv.calendarColor,
+  }));
+}
+
+/** 在飞书上创建一个日程，返回飞书事件 JSON */
+async function feishuCreateEvent(cal, body) {
+  const allDay = !!body.allDay;
+  const startT = allDay ? parseDate(body.start) : new Date(body.start);
+  const endT = allDay ? parseDate(body.end) : new Date(body.end);
+  if (!startT || isNaN(startT.getTime()) || !endT || isNaN(endT.getTime())) {
+    throw new Error('时间格式无效');
+  }
+  const payload = {
+    summary: body.title,
+    start_time: {},
+    end_time: {},
+  };
+  if (body.notes) payload.description = String(body.notes);
+  if (allDay) {
+    const p = (n) => String(n).padStart(2, '0');
+    payload.is_all_day = true;
+    // 飞书全天事件 date 字段：结束日期含当天
+    payload.start_time.date = `${startT.getFullYear()}-${p(startT.getMonth() + 1)}-${p(startT.getDate())}`;
+    payload.end_time.date = `${endT.getFullYear()}-${p(endT.getMonth() + 1)}-${p(endT.getDate())}`;
+  } else {
+    const tz = 'Asia/Shanghai';
+    payload.start_time = { timestamp: String(Math.floor(startT.getTime() / 1000)), timezone: tz };
+    payload.end_time = { timestamp: String(Math.floor(endT.getTime() / 1000)), timezone: tz };
+  }
+  const data = await feishuReq('/open-apis/calendar/v4/calendars/' + encodeURIComponent(cal.feishuCalendarId) + '/events', {
+    method: 'POST',
+    auth: 'user',
+    body: payload,
+  });
+  return data.event;
+}
+
+/** 飞书 user_info（显示授权账号名） */
+async function feishuUserInfo() {
+  const data = await feishuReq('/open-apis/authen/v1/user_info', { auth: 'user' });
+  return { openId: data.open_id || '', name: data.name || data.en_name || '' };
+}
+
+/** 计算远程源同步窗口（与 CalDAV/ICS 一致：过去 2 年 ~ 未来 3 年） */
+function syncWindow() {
+  const now = new Date();
+  return {
+    from: new Date(now.getFullYear() - 2, now.getMonth(), now.getDate()),
+    to: new Date(now.getFullYear() + 3, now.getMonth(), now.getDate()),
+  };
 }
 
 function cacheFile(id) {
@@ -489,6 +875,16 @@ function parseICSContent(icsBlocks) {
 /** 同步单个日历源 */
 async function syncCalendar(cal) {
   try {
+    if (cal.type === 'feishu') {
+      // 飞书日历：走开放平台 REST（OAuth 授权），事件缓存与 CalDAV/ICS 同一机制
+      const win = syncWindow();
+      const events = await fetchFeishuEvents(cal, win.from, win.to);
+      saveCache(cal.id, events);
+      cal.lastSync = new Date().toISOString();
+      cal.lastError = '';
+      cal.eventCount = events.length;
+      return cal;
+    }
     const icsText = await fetchRemoteICS(cal);
     const events = parseICSContent(icsText);
     saveCache(cal.id, events);
@@ -504,7 +900,7 @@ async function syncCalendar(cal) {
 
 /** 日历源信息（不含密码） */
 function publicCalendar(cal) {
-  return {
+  const pub = {
     id: cal.id,
     name: cal.name,
     url: cal.url,
@@ -516,6 +912,17 @@ function publicCalendar(cal) {
     eventCount: cal.eventCount || 0,
     hasPassword: !!cal.password,
   };
+  if (cal.type === 'feishu') {
+    pub.feishuCalendarId = cal.feishuCalendarId || '';
+    pub.feishuSummary = cal.feishuSummary || '';
+    pub.feishuRole = cal.feishuRole || '';
+  }
+  return pub;
+}
+
+/** 判断某日历源是否可写入日程（本地个人日历之外，仅飞书日历支持写回） */
+function isWritableCalendar(cal) {
+  return !!cal && cal.type === 'feishu' && !!cal.feishuCalendarId;
 }
 
 /* ------------------------------------------------------------------ */
@@ -839,13 +1246,36 @@ function handleApi(method, segments, req, res) {
       return sendJson(res, 200, loadCalendars().map(publicCalendar));
     }
 
-    // POST /api/calendars — 添加日历源（先试同步，失败则报错不入库）
+    // POST /api/calendars — 添加日历源（ics/caldav 订阅；feishu 需已 OAuth 授权）
     if (method === 'POST' && segments.length === 1) {
       return readBody(req).then(async (body) => {
         const name = String(body.name || '').trim();
         const url = String(body.url || '').trim();
-        const type = body.type === 'caldav' ? 'caldav' : 'ics';
+        const type = body.type === 'caldav' ? 'caldav' : (body.type === 'feishu' ? 'feishu' : 'ics');
         if (!name) return sendJson(res, 400, { error: '请输入日历名称' });
+        if (type === 'feishu') {
+          const fid = String(body.feishuCalendarId || '').trim();
+          if (!fid) return sendJson(res, 400, { error: '缺少飞书日历（请先授权并选择要导入的日历）' });
+          const fcfg = loadFeishu();
+          if (!fcfg.accessToken) return sendJson(res, 400, { error: '尚未授权飞书账号，请先在弹窗中完成授权' });
+          const cal = {
+            id: crypto.randomUUID(),
+            name,
+            type: 'feishu',
+            feishuCalendarId: fid,
+            feishuSummary: String(body.feishuSummary || body.name || '').trim(),
+            feishuRole: String(body.feishuRole || '').trim(),
+            color: body.color || 'purple',
+            lastSync: '',
+            lastError: '',
+            eventCount: 0,
+          };
+          await syncCalendar(cal); // 失败不阻塞入库（lastError 红字提示可重试）
+          const list = loadCalendars();
+          list.push(cal);
+          saveCalendars(list);
+          return sendJson(res, 200, publicCalendar(cal));
+        }
         if (!/^https?:\/\/|^webcal:\/\//i.test(url)) {
           return sendJson(res, 400, { error: '请输入有效的 http(s)/webcal URL' });
         }
@@ -911,9 +1341,9 @@ function handleApi(method, segments, req, res) {
       return sendJson(res, 200, result.sort((a, b) => String(a.start).localeCompare(String(b.start))));
     }
 
-    // PUT /api/calendars/:id — 修改日历源信息（名称/地址/账号/密码/颜色）。
-    // 名称/颜色仅影响展示，不触发同步；地址/类型/账号/密码变化时清掉旧缓存并重新同步，
-    // 失败不抛出（lastError 红字提示，可稍后重试），避免修改后仍展示旧地址的过期数据。
+    // PUT /api/calendars/:id — 修改日历源信息。
+    // ics/caldav：名称/颜色仅展示不重同步；地址/账号/密码变化清缓存并重同步。
+    // feishu：仅允许名称/颜色（展示性字段），授权/日历绑定不可通过 PUT 变更。
     if (method === 'PUT' && segments.length === 2) {
       const id = segments[1];
       return readBody(req).then(async (body) => {
@@ -921,6 +1351,18 @@ function handleApi(method, segments, req, res) {
         const idx = list.findIndex((c) => c.id === id);
         if (idx < 0) return sendJson(res, 404, { error: 'calendar not found' });
         const cal = list[idx];
+
+        // 飞书日历源：只更新展示字段
+        if (cal.type === 'feishu') {
+          if (body.name !== undefined) {
+            const n = String(body.name || '').trim();
+            if (!n) return sendJson(res, 400, { error: '请输入日历名称' });
+            cal.name = n;
+          }
+          if (body.color) cal.color = body.color;
+          saveCalendars(list);
+          return sendJson(res, 200, Object.assign({}, publicCalendar(cal), { resynced: false }));
+        }
 
         const next = {
           name: body.name !== undefined ? String(body.name || '').trim() : cal.name,
@@ -975,6 +1417,92 @@ function handleApi(method, segments, req, res) {
       }).catch((e) => sendJson(res, 500, { error: e.message }));
     }
 
+    // POST /api/calendars/:id/events — 在可写日历源（飞书）上创建日程并即时同步回本地缓存
+    if (method === 'POST' && segments.length === 3 && segments[2] === 'events') {
+      const id = segments[1];
+      return readBody(req).then(async (body) => {
+        const list = loadCalendars();
+        const cal = list.find((c) => c.id === id);
+        if (!cal) return sendJson(res, 404, { error: 'calendar not found' });
+        if (!isWritableCalendar(cal)) {
+          return sendJson(res, 400, { error: '该日历为只读订阅，不支持在此新建日程' });
+        }
+        const err = validateEvent(body, false);
+        if (err) return sendJson(res, 400, { error: err });
+        const feEvent = await feishuCreateEvent(cal, body);
+        // 写回成功：转换内部事件并入缓存（避免整窗重拉，读取端会按 start 排序）
+        const intl = feishuEventToInternal(feEvent, cal.id, cal.name, cal.color);
+        const cached = loadCache(cal.id);
+        if (!cached.some((e) => e.id === intl.id)) cached.push(intl);
+        saveCache(cal.id, cached);
+        cal.eventCount = cached.length;
+        cal.lastSync = new Date().toISOString();
+        saveCalendars(list);
+        return sendJson(res, 200, { event: intl });
+      }).catch((e) => sendJson(res, 400, { error: e.message }));
+    }
+
+    return sendJson(res, 404, { error: 'not found' });
+  }
+
+  /* -------- 飞书 OAuth 连接与日历管理 -------- */
+
+  if (segments[0] === 'feishu') {
+    // GET /api/feishu/status — 应用配置 / 授权状态 / 日历列表缓存
+    if (method === 'GET' && segments[1] === 'status') {
+      const cfg = loadFeishu();
+      return sendJson(res, 200, {
+        configured: !!(cfg.appId && cfg.appSecret),
+        authorized: !!cfg.accessToken,
+        userName: cfg.userName || '',
+        calendars: Array.isArray(cfg.calendars) ? cfg.calendars : [],
+        scopeHint: FEISHU_SCOPE_HINT,
+      });
+    }
+
+    // POST /api/feishu/app — 保存飞书开放平台应用凭证（App ID / App Secret）
+    if (method === 'POST' && segments[1] === 'app') {
+      return readBody(req).then((body) => {
+        const appId = String(body.appId || '').trim();
+        const appSecret = String(body.appSecret || '').trim();
+        if (!/^cli_[A-Za-z0-9]+$/.test(appId)) return sendJson(res, 400, { error: 'App ID 格式不正确（应以 cli_ 开头）' });
+        if (appSecret.length < 8) return sendJson(res, 400, { error: 'App Secret 长度不正确' });
+        const cfg = loadFeishu();
+        const appChanged = cfg.appId !== appId || cfg.appSecret !== appSecret;
+        cfg.appId = appId;
+        cfg.appSecret = appSecret;
+        // 应用换绑后旧授权失效，清除 token 要求重新授权
+        if (appChanged) {
+          cfg.accessToken = '';
+          cfg.refreshToken = '';
+          cfg.tokenExpiresAt = 0;
+          cfg.userName = '';
+          cfg.calendars = [];
+        }
+        saveFeishu(cfg);
+        return sendJson(res, 200, { ok: true, configured: true, authorized: !!cfg.accessToken });
+      }).catch((e) => sendJson(res, 400, { error: e.message }));
+    }
+
+    // GET /api/feishu/auth-url — 构造授权链接（需先在飞书开放平台登记回调地址）
+    if (method === 'GET' && segments[1] === 'auth-url') {
+      const cfg = loadFeishu();
+      if (!cfg.appId || !cfg.appSecret) return sendJson(res, 400, { error: '请先填写飞书应用凭证' });
+      return sendJson(res, 200, feishuAuthUrl(cfg, req));
+    }
+
+    // POST /api/feishu/refresh — 重新拉取授权账号可见的飞书日历列表
+    if (method === 'POST' && segments[1] === 'refresh') {
+      const cfg = loadFeishu();
+      if (!cfg.accessToken) return sendJson(res, 400, { error: '尚未授权飞书账号' });
+      return feishuListCalendars().then((cals) => {
+        cfg.calendars = cals;
+        cfg.lastCalRefresh = new Date().toISOString();
+        saveFeishu(cfg);
+        return sendJson(res, 200, { calendars: cals });
+      }).catch((e) => sendJson(res, 400, { error: e.message }));
+    }
+
     return sendJson(res, 404, { error: 'not found' });
   }
 
@@ -993,6 +1521,90 @@ function validateEvent(body, isUpdate) {
   if (start >= end && !body.allDay) return '结束时间必须晚于开始时间';
   if (body.allDay && start > end) return '结束日期不能早于开始日期';
   return null;
+}
+
+/** 渲染简单的 HTML 结果页（授权回调用） */
+function sendHtml(res, code, title, bodyHtml) {
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<style>
+body{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;background:#f5f5f7;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;color:#333}
+.card{background:#fff;border-radius:14px;box-shadow:0 6px 24px rgba(0,0,0,.08);padding:36px 44px;max-width:520px;text-align:center}
+h2{margin:0 0 12px;font-size:20px} p{font-size:14px;line-height:1.7;color:#666}
+.ok{color:#2e9e44} .err{color:#d93025}
+</style></head>
+<body><div class="card">${bodyHtml}</div></body></html>`;
+  const data = Buffer.from(html, 'utf8');
+  res.writeHead(code, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Content-Length': data.length,
+    'Cache-Control': 'no-store',
+  });
+  res.end(data);
+}
+
+/** 飞书 OAuth 授权回调：code 换 user token → 落盘 → 预热用户信息与日历列表 */
+async function handleFeishuOAuthCallback(req, res) {
+  const params = new URL(req.url, 'http://x').searchParams;
+  const code = params.get('code') || '';
+  const state = params.get('state') || '';
+  const error = params.get('error') || '';
+  const cfg = loadFeishu();
+
+  if (error || !code) {
+    return sendHtml(res, 200, '授权未完成',
+      `<h2 class="err">授权未完成</h2><p>${error ? '飞书返回：' + error : '未收到授权码'}。请返回日历页面重试。</p>
+      <p><button onclick="window.close()" style="padding:8px 18px;border:0;border-radius:8px;background:#1e88e5;color:#fff;cursor:pointer">关闭窗口</button></p>`);
+  }
+  // state 防 CSRF：不匹配时拒绝（仅在本地存在待授权 state 时校验）
+  if (cfg.pendingState && state !== cfg.pendingState) {
+    return sendHtml(res, 200, '授权失败', '<h2 class="err">授权校验失败</h2><p>state 不匹配，请返回日历页面重新发起授权。</p>');
+  }
+  cfg.pendingState = '';
+
+  try {
+    // 1) app_access_token
+    const appTok = await feishuAppToken();
+    // 2) 用授权码换 user_access_token
+    const data = await feishuReq('/open-apis/authen/v1/oidc/access_token', {
+      method: 'POST',
+      auth: 'app',
+      body: { grant_type: 'authorization_code', code },
+    });
+    cfg.accessToken = data.access_token;
+    cfg.refreshToken = data.refresh_token;
+    cfg.tokenExpiresAt = Date.now() + (data.expires_in || 7200) * 1000;
+    // 先落盘 token：预热接口（user_info/日历列表）内部通过文件读取 token
+    saveFeishu(cfg);
+    // 3) 预热：用户信息 + 日历列表（失败不影响授权完成）
+    try {
+      const info = await feishuUserInfo();
+      cfg.userOpenId = info.openId;
+      cfg.userName = info.name;
+    } catch (e) { /* 忽略 */ }
+    try {
+      cfg.calendars = await feishuListCalendars();
+      cfg.lastCalRefresh = new Date().toISOString();
+    } catch (e) { /* 忽略 */ }
+    saveFeishu(cfg);
+
+    return sendHtml(res, 200, '授权成功',
+      `<h2 class="ok">✅ 飞书授权成功</h2><p>账号：${escapeHtml(cfg.userName || '')}</p>
+      <p id="tip">正在跳转回日历页面…</p>
+      <script>
+        try { if (window.opener) { window.opener.postMessage({source:'fn-calendar', type:'feishu-oauth-success'}, '*'); document.getElementById('tip').textContent='请回到日历页面继续操作，可关闭本窗口。'; } else { document.getElementById('tip').textContent='本窗口由日历页面打开。请手动关闭并刷新日历页面。'; } } catch(e){}
+      <\/script>`);
+  } catch (e) {
+    return sendHtml(res, 200, '授权失败',
+      `<h2 class="err">授权失败</h2><p>${escapeHtml(e.message)}</p>
+      <p>授权码仅可使用一次，请返回日历页面重新发起授权。</p>`);
+  }
+}
+
+function escapeHtml(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 const server = http.createServer((req, res) => {
@@ -1016,6 +1628,10 @@ const server = http.createServer((req, res) => {
     }
     if (urlPath === '/health') {
       return sendText(res, 200, 'OK');
+    }
+    // 飞书 OAuth 授权回调（用户在飞书授权后跳转回本页）
+    if (urlPath === '/feishu/oauth/callback') {
+      return handleFeishuOAuthCallback(req, res);
     }
     if (segments[0] === 'api') {
       return handleApi(req.method, segments.slice(1), req, res);

@@ -208,6 +208,8 @@ async function loadCalendars() {
 }
 
 async function loadRemoteEvents() {
+  // 防止与 loadCalendars 并发时的竞态：日历列表尚未就绪（如首次导入后）则先补齐
+  if (!state.calendars.length) await loadCalendars();
   if (!state.calendars.length) { state.remoteEvents = []; return; }
   const r = viewRange();
   try {
@@ -849,6 +851,27 @@ function renderEditor() {
   document.getElementById('btnCancel').textContent = isView ? '关闭' : '取消';
   document.getElementById('formError').textContent = '';
 
+  // 日历选择（仅新建模式）：本地「个人」或已导入的飞书日历
+  const calRow = document.getElementById('evCalRow');
+  if (!isView && !isEdit) {
+    calRow.hidden = false;
+    const sel = document.getElementById('evCalendar');
+    clear(sel);
+    const optLocal = document.createElement('option');
+    optLocal.value = 'local';
+    optLocal.textContent = '个人（本地）';
+    sel.appendChild(optLocal);
+    state.calendars.filter((c) => c.type === 'feishu').forEach((c) => {
+      const o = document.createElement('option');
+      o.value = 'cal:' + c.id;
+      o.textContent = c.name + '（飞书）';
+      sel.appendChild(o);
+    });
+    sel.value = 'local';
+  } else {
+    calRow.hidden = true;
+  }
+
   // 只读模式下禁用全部输入
   ['evStartDate', 'evStartTime', 'evEndDate', 'evEndTime', 'evNotes'].forEach((id) => {
     document.getElementById(id).disabled = isView;
@@ -928,9 +951,18 @@ async function saveEditor() {
   btn.disabled = true;
   try {
     if (state.editing.mode === 'edit') {
+      // 仅本地日程可编辑（远程/飞书日程点击时为只读查看）
       await apiSend('PUT', '/api/events/' + ev.id, ev);
     } else {
-      await apiSend('POST', '/api/events', ev);
+      // 新建：按下拉「日历」选择路由 —— cal:<id> 写回飞书日历，local 写入本地
+      const calSel = document.getElementById('evCalendar');
+      const target = calSel ? calSel.value : 'local';
+      if (target.indexOf('cal:') === 0) {
+        const calId = target.slice(4);
+        await apiSend('POST', '/api/calendars/' + encodeURIComponent(calId) + '/events', ev);
+      } else {
+        await apiSend('POST', '/api/events', ev);
+      }
     }
     closeEditor();
     await refreshAll();
@@ -959,6 +991,7 @@ function closeEditor() {
   });
   document.getElementById('evAllDay').style.pointerEvents = '';
   document.getElementById('btnSave').hidden = false;
+  document.getElementById('btnSave').disabled = false; // 保存成功后复位，便于下次打开
   document.getElementById('btnCancel').textContent = '取消';
   document.getElementById('evColorPicker').hidden = false;
   state.editing = null;
@@ -970,15 +1003,21 @@ function openViewer(ev) {
   renderEditor();
 }
 
-/* ---------------- 添加日历源弹窗 ---------------- */
+/* ---------------- 添加日历源弹窗（公开订阅 / CalDAV / 飞书） ---------------- */
 
 let calModalColor = 'purple';
 let calModalType = 'ics'; // 弹窗当前类型（添加/编辑均可切换，随 setCalType 更新）
 let calEditing = null;    // null=添加模式；否则为正在查看/修改的日历源对象
+let feishuPicked = new Set(); // 添加飞书时勾选的日历（calendarId 集合）
+let feishuAuthWindow = null;
+
+/** 按日历源类型选择默认颜色（自动分配，保证多个飞书日历颜色不同） */
+const PALETTE = ['blue', 'green', 'purple', 'orange', 'teal', 'red'];
 
 function openCalModal(cal) {
   calEditing = cal || null;
   const isEdit = !!cal;
+  feishuPicked = new Set();
 
   document.getElementById('calModalTitle').textContent = isEdit ? '日历信息' : '添加日历';
   document.getElementById('calName').value = isEdit ? (cal.name || '') : '';
@@ -991,7 +1030,6 @@ function openCalModal(cal) {
     : '密码 / 应用专用密码';
   document.getElementById('calError').textContent = '';
   document.getElementById('btnCalSave').disabled = false;
-  document.getElementById('btnCalSave').textContent = isEdit ? '保存' : '添加';
 
   // 同步状态信息（仅查看/修改模式展示）
   document.getElementById('calHint').hidden = isEdit;
@@ -1005,27 +1043,193 @@ function openCalModal(cal) {
     const errEl = document.getElementById('calMetaErr');
     errEl.hidden = !cal.lastError;
     if (cal.lastError) errEl.textContent = '上次同步失败：' + cal.lastError;
+    document.getElementById('btnCalSave').textContent = '保存';
+  } else {
+    document.getElementById('btnCalSave').textContent = '添加';
   }
 
   calModalColor = isEdit ? (cal.color || 'purple') : 'purple';
-  setCalType(isEdit ? (cal.type === 'caldav' ? 'caldav' : 'ics') : 'ics');
+  setCalType(isEdit ? (cal.type === 'caldav' ? 'caldav' : (cal.type === 'feishu' ? 'feishu' : 'ics')) : 'ics');
   renderCalColorPicker();
   document.getElementById('calModalMask').hidden = false;
-  setTimeout(() => document.getElementById('calName').focus(), 50);
+  setTimeout(() => {
+    if (calModalType === 'feishu') refreshFeishuStatus();
+    else document.getElementById('calName').focus();
+  }, 50);
 }
 
 function closeCalModal() {
   document.getElementById('calModalMask').hidden = true;
+  document.getElementById('btnCalSave').disabled = false; // 复位，便于下次打开
   calEditing = null;
 }
 
 function setCalType(t) {
-  calModalType = (t === 'caldav') ? 'caldav' : 'ics';
+  calModalType = (t === 'caldav') ? 'caldav' : (t === 'feishu') ? 'feishu' : 'ics';
   document.querySelectorAll('#calTypeSwitcher button').forEach((b) => {
     b.classList.toggle('active', b.dataset.type === calModalType);
   });
+  const isFeishu = calModalType === 'feishu';
+  const isEdit = !!calEditing;
+  document.getElementById('calUrlRow').style.display = isFeishu ? 'none' : '';
   document.getElementById('calAuthRow').hidden = calModalType !== 'caldav';
+  // 颜色：添加飞书时自动分配不展示；编辑飞书/ics/caldav 时展示
+  document.getElementById('calColorRow').hidden = isFeishu && !isEdit;
+  document.getElementById('calFeishuPanel').hidden = !isFeishu;
+  if (isFeishu) {
+    refreshFeishuStatus();
+  }
 }
+
+/* -------- 飞书授权面板 -------- */
+
+async function refreshFeishuStatus() {
+  const panel = document.getElementById('calFeishuPanel');
+  if (!panel || panel.hidden) return;
+  const statusEl = document.getElementById('feishuStatus');
+  const cfgRow = document.getElementById('feishuAppConfig');
+  const tipEl = document.getElementById('feishuTip');
+  const listEl = document.getElementById('feishuCalList');
+  const redirectEl = document.getElementById('feishuRedirect');
+  const btnAuth = document.getElementById('btnFeishuAuthorize');
+  const btnRefresh = document.getElementById('btnFeishuRefresh');
+  tipEl.hidden = true;
+  redirectEl.hidden = true;
+  listEl.hidden = true;
+  btnAuth.hidden = true;
+  btnRefresh.hidden = true;
+  btnAuth.disabled = false;
+
+  let st;
+  try {
+    st = await apiGet('/api/feishu/status');
+  } catch (e) {
+    statusEl.innerHTML = '<span class="st-err">无法读取飞书状态</span>';
+    return;
+  }
+
+  if (!st.configured) {
+    statusEl.innerHTML = '<span class="st-err">未配置飞书应用凭证</span>';
+    cfgRow.hidden = false;
+    tipEl.hidden = false;
+    tipEl.textContent = '在飞书开放平台创建「企业自建应用」，开通权限 calendar:calendar 并发布版本，然后将 App ID / App Secret 填到此处。';
+    return;
+  }
+  cfgRow.hidden = true;
+
+  if (!st.authorized) {
+    statusEl.innerHTML = '<span class="st-err">未授权 · 已保存应用凭证</span>';
+    btnAuth.hidden = false;
+    try {
+      const au = await apiGet('/api/feishu/auth-url');
+      document.getElementById('feishuRedirectUri').textContent = au.redirectUri;
+      redirectEl.hidden = false;
+      feishuRedirectUri = au; // 保存授权链接供按钮点击使用
+    } catch (e) { /* 忽略 */ }
+    return;
+  }
+
+  // 已授权
+  const who = st.userName ? ('<b>' + st.userName + '</b>') : '飞书账号';
+  statusEl.innerHTML = '<span class="st-ok">已授权 · ' + who + '</span>';
+  btnRefresh.hidden = false;
+
+  // 日历选择列表（添加模式才有意义；编辑模式只展示信息）
+  const cals = st.calendars || [];
+  const isEdit = !!calEditing;
+  if (isEdit) {
+    listEl.hidden = true;
+    return;
+  }
+  if (!cals.length) {
+    listEl.hidden = false;
+    clear(listEl);
+    listEl.appendChild(el('div', 'feishu-cal-item', '（未发现可导入的日历，点「刷新日历列表」重试）'));
+    return;
+  }
+  listEl.hidden = false;
+  clear(listEl);
+  const imported = new Set(state.calendars.filter((c) => c.type === 'feishu').map((c) => c.feishuCalendarId));
+  cals.forEach((c, i) => {
+    const row = el('label', 'feishu-cal-item');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = !imported.has(c.calendarId);
+    if (imported.has(c.calendarId)) cb.disabled = true; // 已导入的不再重复添加
+    cb.addEventListener('change', () => {
+      if (cb.checked) feishuPicked.add(c.calendarId);
+      else feishuPicked.delete(c.calendarId);
+    });
+    if (!imported.has(c.calendarId)) feishuPicked.add(c.calendarId);
+    const name = el('span', 'fc-name', c.summary + (imported.has(c.calendarId) ? '（已导入）' : ''));
+    const role = el('span', 'fc-role', c.role || '');
+    row.append(cb, name, role);
+    listEl.appendChild(row);
+  });
+}
+
+let feishuRedirectUri = null;
+
+async function authorizeFeishu() {
+  if (!feishuRedirectUri) {
+    try {
+      feishuRedirectUri = await apiGet('/api/feishu/auth-url');
+    } catch (e) {
+      alert('获取授权链接失败：' + e.message);
+      return;
+    }
+  }
+  feishuAuthWindow = window.open(feishuRedirectUri.url, 'feishu_oauth', 'width=560,height=720');
+  if (!feishuAuthWindow) alert('请允许浏览器弹出窗口以完成飞书授权');
+}
+
+async function saveFeishuApp() {
+  const appId = document.getElementById('feishuAppId').value.trim();
+  const appSecret = document.getElementById('feishuAppSecret').value.trim();
+  const tipEl = document.getElementById('feishuTip');
+  try {
+    await apiSend('POST', '/api/feishu/app', { appId, appSecret });
+    document.getElementById('feishuAppId').value = '';
+    document.getElementById('feishuAppSecret').value = '';
+    tipEl.textContent = '';
+    await refreshFeishuStatus();
+  } catch (e) {
+    tipEl.hidden = false;
+    tipEl.classList.add('tip-err');
+    tipEl.textContent = e.message;
+  }
+}
+
+async function refreshFeishuCals() {
+  const btn = document.getElementById('btnFeishuRefresh');
+  const listEl = document.getElementById('feishuCalList');
+  btn.disabled = true;
+  btn.textContent = '刷新中…';
+  try {
+    await apiSend('POST', '/api/feishu/refresh');
+    await loadCalendars();
+    await refreshFeishuStatus();
+  } catch (e) {
+    listEl.hidden = false;
+    clear(listEl);
+    listEl.appendChild(el('div', 'feishu-cal-item', '刷新失败：' + e.message));
+  }
+  btn.disabled = false;
+  btn.textContent = '刷新日历列表';
+}
+
+/** 授权成功的跨窗口回调 */
+function onFeishuAuthSuccess() {
+  alert('飞书授权成功，正在加载日历列表…');
+  feishuRedirectUri = null;
+  refreshFeishuStatus().then(() => {
+    if (calModalType === 'feishu' && !calEditing) {
+      document.getElementById('calError').textContent = '';
+    }
+  });
+}
+
+/* -------- 渲染与保存 -------- */
 
 function renderCalColorPicker() {
   const picker = document.getElementById('calColorPicker');
@@ -1043,11 +1247,75 @@ function renderCalColorPicker() {
 
 async function saveCalModal() {
   const isEdit = !!calEditing;
+  const err = document.getElementById('calError');
   const name = document.getElementById('calName').value.trim();
+
+  // 飞书：添加模式 → 批量导入勾选日历；编辑模式 → 仅更新名称/颜色
+  if (calModalType === 'feishu') {
+    if (isEdit) {
+      if (!name) { err.textContent = '请输入日历名称'; return; }
+      const btn = document.getElementById('btnCalSave');
+      btn.disabled = true;
+      try {
+        await apiSend('PUT', '/api/calendars/' + calEditing.id, { name, color: calModalColor });
+        closeCalModal();
+        await Promise.all([loadCalendars(), loadRemoteEvents()]);
+        render();
+      } catch (ex) {
+        err.textContent = ex.message;
+        btn.disabled = false;
+      }
+      return;
+    }
+    // 添加模式：需要已授权 + 至少勾选一个日历
+    let st = null;
+    try { st = await apiGet('/api/feishu/status'); } catch (e) { /* ignore */ }
+    if (!st || !st.authorized) { err.textContent = '请先完成飞书授权'; return; }
+    if (!feishuPicked.size) { err.textContent = '请至少勾选一个要导入的飞书日历'; return; }
+    const calIdToMeta = {};
+    (st.calendars || []).forEach((c) => { calIdToMeta[c.calendarId] = c; });
+
+    const btn = document.getElementById('btnCalSave');
+    btn.disabled = true;
+    err.textContent = '正在导入并同步…';
+    const imported = [];
+    try {
+      let i = 0;
+      for (const fid of feishuPicked) {
+        const meta = calIdToMeta[fid] || {};
+        const body = {
+          type: 'feishu',
+          name: meta.summary || name || '飞书日历',
+          feishuCalendarId: fid,
+          feishuSummary: meta.summary || '',
+          feishuRole: meta.role || '',
+          color: calModalColor === 'purple' ? (PALETTE[i % PALETTE.length]) : calModalColor,
+        };
+        // 首个导入使用用户选择颜色，其余自动轮换避免同色
+        if (i > 0) body.color = PALETTE[i % PALETTE.length];
+        const cal = await apiSend('POST', '/api/calendars', body);
+        imported.push(cal);
+        i++;
+      }
+      closeCalModal();
+      await Promise.all([loadCalendars(), loadRemoteEvents()]);
+      render();
+      const failed = imported.filter((c) => c && c.lastError);
+      if (failed.length) {
+        alert('已导入 ' + imported.length + ' 个飞书日历，其中 ' + failed.length + ' 个同步失败：\n' +
+          failed.map((c) => '「' + c.name + '」' + c.lastError).join('\n') + '\n\n可稍后在日历列表中点击 ⟳ 重试。');
+      }
+    } catch (ex) {
+      err.textContent = ex.message || '导入失败';
+      btn.disabled = false;
+    }
+    return;
+  }
+
+  // —— ics / caldav ——
   const url = document.getElementById('calUrl').value.trim();
   const username = document.getElementById('calUsername').value.trim();
   const password = document.getElementById('calPassword').value;
-  const err = document.getElementById('calError');
 
   if (!name) { err.textContent = '请输入日历名称'; return; }
   if (!url) { err.textContent = '请输入日历地址'; return; }
@@ -1105,8 +1373,8 @@ function bindEvents() {
     openEditor('create', state.selected);
   });
 
-  // 添加日历源（CalDAV / ICS）
-  document.getElementById('btnAddList').addEventListener('click', openCalModal);
+  // 添加日历源（CalDAV / ICS / 飞书）——必须箭头包装，避免把 MouseEvent 当成 cal（否则误入编辑模式）
+  document.getElementById('btnAddList').addEventListener('click', () => openCalModal());
   document.getElementById('btnCalModalClose').addEventListener('click', closeCalModal);
   document.getElementById('btnCalCancel').addEventListener('click', closeCalModal);
   document.getElementById('btnCalSave').addEventListener('click', saveCalModal);
@@ -1118,6 +1386,17 @@ function bindEvents() {
   });
   document.getElementById('calModalMask').addEventListener('keydown', (e) => {
     if (e.key === 'Escape') closeCalModal();
+  });
+
+  // 飞书授权面板
+  document.getElementById('btnFeishuAuthorize').addEventListener('click', authorizeFeishu);
+  document.getElementById('btnFeishuSaveApp').addEventListener('click', saveFeishuApp);
+  document.getElementById('btnFeishuRefresh').addEventListener('click', refreshFeishuCals);
+  // 飞书授权窗口成功回调（window.opener.postMessage）
+  window.addEventListener('message', (e) => {
+    if (e.data && typeof e.data === 'object' && e.data.type === 'feishu-oauth-success') {
+      onFeishuAuthSuccess();
+    }
   });
 
   document.getElementById('btnModalClose').addEventListener('click', closeEditor);
