@@ -253,31 +253,58 @@ async function feishuListCalendars() {
 function feishuEventToInternal(ev, fid, cname, ccolor) {
   const startRaw = (ev.start_time || {});
   const endRaw = (ev.end_time || {});
-  const allDay = !!ev.is_all_day || (!!startRaw.date && !startRaw.timestamp);
+  const p2 = (n) => String(n).padStart(2, '0');
   const fmt = (ts) => {
     const d = new Date(ts * 1000);
-    const p = (n) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+    return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}T${p2(d.getHours())}:${p2(d.getMinutes())}`;
   };
-  const fmtUtcDate = (ts) => {
+  // 时间戳 → 所在日期。全天日程时区固定 UTC+0：整日时间戳（%86400==0）按 UTC 取日期，否则按本地时区取。
+  const dayOfTs = (ts) => {
     const d = new Date(ts * 1000);
-    const p = (n) => String(n).padStart(2, '0');
-    return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`;
+    return (ts % 86400 === 0)
+      ? `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())}`
+      : `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
   };
-  // 全天日程取日期：优先 date 字段；若只有整日时间戳（UTC 零点，飞书全天时区固定 UTC+0）则按 UTC 取日期
-  const allDayDate = (raw) => {
-    if (raw.date) return String(raw.date);
-    if (raw.timestamp) {
-      const ts = Number(raw.timestamp);
-      return (ts % 86400 === 0) ? fmtUtcDate(ts) : fmt(ts);
+  const isMidnightTs = (ts) => {
+    if (ts % 86400 === 0) return true;
+    const d = new Date(ts * 1000);
+    return d.getHours() === 0 && d.getMinutes() === 0 && d.getSeconds() === 0;
+  };
+  const shiftDay = (day, delta) => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day || '');
+    if (!m) return day;
+    const d = new Date(+m[1], +m[2] - 1, +m[3] + delta);
+    return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+  };
+  const sTs = startRaw.timestamp ? Number(startRaw.timestamp) : 0;
+  const eTs = endRaw.timestamp ? Number(endRaw.timestamp) : 0;
+  /**
+   * 全天判定。飞书以 time_info.date 标记全天（date 与 timestamp 互斥，date 有值即为全天），
+   * 但实际返回中 date 与 timestamp 常同时出现 —— 不能因为「存在 timestamp」就否定全天：
+   * 一旦误判为定时事件，结束时刻（末日次日零点）按本地时区格式化后就成了「所选结束日 +1 的 00:00」，
+   * 表现为日程多占一天、结束时间显示 +1。
+   * 兜底：is_all_day 为真；或起止都落在零点且跨整日。
+   */
+  const allDay = !!ev.is_all_day
+    || !!startRaw.date || !!endRaw.date
+    || (sTs > 0 && eTs > 0 && isMidnightTs(sTs) && isMidnightTs(eTs)
+        && eTs >= sTs && (eTs - sTs) % 86400 === 0);
+  let start;
+  let end;
+  if (allDay) {
+    // 有 timestamp 时它以「确切时刻」为准（date 在不同接口上的含/排他语义不一致，仅作兜底）
+    start = sTs ? dayOfTs(sTs) : (startRaw.date ? String(startRaw.date) : '');
+    if (eTs) {
+      // end_time 是「日程结束的那一刻」：全天日程即末日次日零点（排他），故取所在日期后减 1 天得到含当天的末日
+      end = (isMidnightTs(eTs) && eTs > sTs) ? shiftDay(dayOfTs(eTs), -1) : dayOfTs(eTs);
+    } else {
+      end = endRaw.date ? String(endRaw.date) : start;
     }
-    return '';
-  };
-  const start = allDay ? allDayDate(startRaw) : (startRaw.timestamp ? fmt(Number(startRaw.timestamp)) : (startRaw.date || ''));
-  // 全天：飞书 date 结束日期含当天（内部 end 为最后一天，直接沿用）；非全天用 timestamp
-  const end = allDay
-    ? (allDayDate(endRaw) || allDayDate(startRaw) || start)
-    : (endRaw.timestamp ? fmt(Number(endRaw.timestamp)) : start);
+    if (start && end < start) end = start;
+  } else {
+    start = startRaw.timestamp ? fmt(sTs) : (startRaw.date || '');
+    end = endRaw.timestamp ? fmt(eTs) : start;
+  }
   return {
     id: ev.event_id + (ev.recurring_event_id && ev.recurring_event_id !== ev.event_id ? '@' + ev.event_id : ''),
     title: ev.summary && String(ev.summary).trim() ? String(ev.summary) : '（无标题）',
