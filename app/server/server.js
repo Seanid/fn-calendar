@@ -284,6 +284,7 @@ function feishuEventToInternal(ev, fid, cname, ccolor) {
    * 一旦误判为定时事件，结束时刻（末日次日零点）按本地时区格式化后就成了「所选结束日 +1 的 00:00」，
    * 表现为日程多占一天、结束时间显示 +1。
    * 兜底：is_all_day 为真；或起止都落在零点且跨整日。
+   * 注意「判定为全天」只解决类型，结束日还需按下面的排他语义回退一天，两者缺一不可。
    */
   const allDay = !!ev.is_all_day
     || !!startRaw.date || !!endRaw.date
@@ -294,11 +295,16 @@ function feishuEventToInternal(ev, fid, cname, ccolor) {
   if (allDay) {
     // 有 timestamp 时它以「确切时刻」为准（date 在不同接口上的含/排他语义不一致，仅作兜底）
     start = sTs ? dayOfTs(sTs) : (startRaw.date ? String(startRaw.date) : '');
+    // 结束：飞书的 end_time 表示「日程结束的那一刻」——全天日程即末日次日零点（排他，与 ICS DTEND 同义）。
+    // 注意飞书两侧语义不对称：**写入**接受「最后一天」（含当天，见 feishuCreateEvent），
+    // 但**读取**回包的是结束时刻（末日次日）。实测（真实账号）：9/21~9/24 的育儿假读回 end.date = "2026-09-25"。
+    // 因此无论回包是 date 还是零点 timestamp，都要回退一天才是含当天的末日。
     if (eTs) {
-      // end_time 是「日程结束的那一刻」：全天日程即末日次日零点（排他），故取所在日期后减 1 天得到含当天的末日
       end = (isMidnightTs(eTs) && eTs > sTs) ? shiftDay(dayOfTs(eTs), -1) : dayOfTs(eTs);
+    } else if (endRaw.date) {
+      end = shiftDay(String(endRaw.date), -1);
     } else {
-      end = endRaw.date ? String(endRaw.date) : start;
+      end = start;
     }
     if (start && end < start) end = start;
   } else {
