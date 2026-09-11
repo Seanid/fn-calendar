@@ -259,10 +259,24 @@ function feishuEventToInternal(ev, fid, cname, ccolor) {
     const p = (n) => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
   };
-  const start = startRaw.timestamp ? fmt(Number(startRaw.timestamp)) : (startRaw.date || '');
+  const fmtUtcDate = (ts) => {
+    const d = new Date(ts * 1000);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`;
+  };
+  // 全天日程取日期：优先 date 字段；若只有整日时间戳（UTC 零点，飞书全天时区固定 UTC+0）则按 UTC 取日期
+  const allDayDate = (raw) => {
+    if (raw.date) return String(raw.date);
+    if (raw.timestamp) {
+      const ts = Number(raw.timestamp);
+      return (ts % 86400 === 0) ? fmtUtcDate(ts) : fmt(ts);
+    }
+    return '';
+  };
+  const start = allDay ? allDayDate(startRaw) : (startRaw.timestamp ? fmt(Number(startRaw.timestamp)) : (startRaw.date || ''));
   // 全天：飞书 date 结束日期含当天（内部 end 为最后一天，直接沿用）；非全天用 timestamp
   const end = allDay
-    ? (endRaw.date || startRaw.date || start)
+    ? (allDayDate(endRaw) || allDayDate(startRaw) || start)
     : (endRaw.timestamp ? fmt(Number(endRaw.timestamp)) : start);
   return {
     id: ev.event_id + (ev.recurring_event_id && ev.recurring_event_id !== ev.event_id ? '@' + ev.event_id : ''),
@@ -883,6 +897,22 @@ function splitIcsBlocks(text) {
   return out.length ? out : (t.trim() ? [t] : []);
 }
 
+/**
+ * 判断是否为「以零点时间表达的全天日程」。
+ * 不少订阅源（含部分 CalDAV 服务）不写 VALUE=DATE，而是用
+ *   DTSTART:20260921T000000Z / DTEND:20260925T000000Z
+ * 这种零点时刻表达日期。若按定时事件处理，UTC 零点会被换算成本地 08:00，
+ * 于是 21~24 的日程会在 25 日也多显示一天（结束时间被记成 25 日）。
+ * 判定：起止都恰在整分零点（本地零点或 UTC 零点）且区间跨天。
+ */
+function isMidnightSpan(start, end) {
+  if (!start || !end || end.getTime() <= start.getTime()) return false;
+  const atZero = (d) =>
+    (d.getHours() === 0 && d.getMinutes() === 0) ||
+    (d.getUTCHours() === 0 && d.getUTCMinutes() === 0);
+  return atZero(start) && atZero(end);
+}
+
 /** 解析 ICS 文本为内部事件格式（逐块解析后合并，展开循环事件，窗口：过去2年 ~ 未来3年） */
 function parseICSContent(icsBlocks) {
   const out = [];
@@ -902,7 +932,8 @@ function parseICSContent(icsBlocks) {
 
     for (const ev of raw) {
       if (!ev.start || !ev.summary) continue;
-      const allDay = ev.datetype === 'date';
+      // 全天判定：VALUE=DATE，或以零点时间表达日期且跨天（见 isMidnightSpan）
+      const allDay = ev.datetype === 'date' || isMidnightSpan(ev.start, ev.end);
       const durationMs = ev.end && ev.start ? ev.end.getTime() - ev.start.getTime() : 3600000;
 
       let instances = [ev];
