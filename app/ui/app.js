@@ -988,6 +988,12 @@ function navigate(delta) {
 
 /* ---------------- 日程编辑弹窗 ---------------- */
 
+/* 弹窗打开后的遮罩点击宽限期：双击日程时第一次 click 打开弹窗，遮罩会立刻盖住日程，
+   第二次 click 便落在遮罩上、被误判为「点遮罩关闭」——表现为弹窗闪一下就没了、双击新增不稳定。
+   打开后短暂忽略遮罩点击即可，不影响用户之后正常的点击关闭。 */
+let modalGuardUntil = 0;
+const MODAL_GUARD_MS = 500;
+
 function openEditor(mode, arg, startMin) {
   if (mode === 'edit') {
     // arg 为要编辑的日程对象；original 为打开时的快照（保存时用于判断是否变更了时间）
@@ -1106,6 +1112,7 @@ function renderEditor() {
   });
 
   modal.hidden = false;
+  modalGuardUntil = Date.now() + MODAL_GUARD_MS;
 }
 
 function syncTimeVisibility() {
@@ -1629,7 +1636,8 @@ function bindEvents() {
   });
 
   document.getElementById('modalMask').addEventListener('click', (e) => {
-    if (e.target.id === 'modalMask') closeEditor();
+    // 双击日程时第二次 click 会落在刚弹出的遮罩上；宽限期内忽略，避免弹窗刚打开就被关掉
+    if (e.target.id === 'modalMask' && Date.now() > modalGuardUntil) closeEditor();
   });
 
   document.addEventListener('keydown', (e) => {
