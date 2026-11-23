@@ -1348,9 +1348,11 @@ function renderEditor() {
   const hint = document.getElementById('evHint');
   if (hint) {
     if (ed.todoId) {
-      hint.textContent = ed.todoSource === 'feishu'
-        ? '由飞书任务「' + (ed.todoTitle || ev.title) + '」创建日程；保存后会同时删除该飞书任务（请确保已授权任务删除权限）。'
-        : '由待办「' + (ed.todoTitle || ev.title) + '」创建日程；保存后该待办将从待办栏删除（手工勾选完成的待办仍会保留）。';
+      const hasFeishuCal = state.calendars.some((c) => c.type === 'feishu');
+      const tail = hasFeishuCal ? '可在「日历」中选择写入本地或飞书日历。' : '';
+      hint.textContent = (ed.todoSource === 'feishu'
+        ? '由飞书任务「' + (ed.todoTitle || ev.title) + '」创建日程；保存后会同时删除该飞书任务。'
+        : '由待办「' + (ed.todoTitle || ev.title) + '」创建日程；保存后该待办将从待办栏删除（手工勾选完成的待办仍会保留）。') + tail;
       hint.hidden = false;
     } else if (isEdit && isRecurringInstance(ev)) {
       hint.textContent = '这是重复系列中的其中一次：标题与备注会应用到整个系列；如需调整某一次的时间，请到飞书客户端操作。点击删除将移除整个系列。';
@@ -1360,9 +1362,11 @@ function renderEditor() {
     }
   }
 
-  // 日历选择（仅新建模式）：本地「个人」或已导入的飞书日历。待办转日程固定写入本地日历
+  // 日历选择（新建与待办转日程）：本地「个人」或已导入的飞书日历
+  // 待办转日程时若没有飞书日历，保持隐藏（固定写本地）
   const calRow = document.getElementById('evCalRow');
-  if (!isView && !isEdit && !ed.todoId) {
+  const feishuCals = state.calendars.filter((c) => c.type === 'feishu');
+  if (!isView && !isEdit && (!ed.todoId || feishuCals.length > 0)) {
     calRow.hidden = false;
     const sel = document.getElementById('evCalendar');
     clear(sel);
@@ -1370,7 +1374,7 @@ function renderEditor() {
     optLocal.value = 'local';
     optLocal.textContent = '个人（本地）';
     sel.appendChild(optLocal);
-    state.calendars.filter((c) => c.type === 'feishu').forEach((c) => {
+    feishuCals.forEach((c) => {
       const o = document.createElement('option');
       o.value = 'cal:' + c.id;
       o.textContent = c.name + '（飞书）';
@@ -1481,10 +1485,14 @@ async function saveEditor() {
       if (state.editing.todoId) {
         const todoTitle = state.editing.todoTitle || ev.title;
         const isFeishu = state.editing.todoSource === 'feishu';
+        const calSel = document.getElementById('evCalendar');
+        const calRowEl = document.getElementById('evCalRow');
+        const picked = calSel && calRowEl && !calRowEl.hidden ? calSel.value : 'local';
+        const calendarId = picked.indexOf('cal:') === 0 ? picked.slice(4) : '';
         const path = isFeishu
           ? '/api/todos/feishu/' + encodeURIComponent(state.editing.todoId) + '/convert'
           : '/api/todos/' + encodeURIComponent(state.editing.todoId) + '/convert';
-        const result = await apiSend('POST', path, ev);
+        const result = await apiSend('POST', path, Object.assign({}, ev, calendarId ? { calendarId } : {}));
         closeEditor();
         await refreshAll();
         if (isFeishu) {
@@ -1494,7 +1502,8 @@ async function saveEditor() {
         if (result && result.warning) {
           showTodoNotice('「' + todoTitle + '」已转为日程，但飞书任务删除失败：' + result.warning);
         } else {
-          showTodoNotice('「' + todoTitle + '」已转为日程，' + (isFeishu ? '飞书任务已删除' : '待办已删除'));
+          const where = result && result.calendarId ? '飞书日历' : '本地日历';
+          showTodoNotice('「' + todoTitle + '」已转为日程（' + where + '），' + (isFeishu ? '飞书任务已删除' : '待办已删除'));
         }
         return;
       }
@@ -1646,9 +1655,13 @@ async function refreshFeishuStatus() {
   const redirectEl = document.getElementById('feishuRedirect');
   const btnAuth = document.getElementById('btnFeishuAuthorize');
   const btnRefresh = document.getElementById('btnFeishuRefresh');
+  const tokenBox = document.getElementById('feishuTokenBox');
+  const tokenLabel = document.getElementById('feishuTokenLabel');
+  const btnClearToken = document.getElementById('btnFeishuClearToken');
   tipEl.hidden = true;
   redirectEl.hidden = true;
   listEl.hidden = true;
+  tokenBox.hidden = true;
   btnAuth.hidden = true;
   btnRefresh.hidden = true;
   btnAuth.disabled = false;
@@ -1669,6 +1682,24 @@ async function refreshFeishuStatus() {
     return;
   }
   cfgRow.hidden = true;
+  tokenBox.hidden = false;
+  if (st.authorized) {
+    let expTxt = '';
+    const expAt = Number(st.tokenExpiresAt || 0);
+    if (expAt) {
+      const d = new Date(expAt);
+      if (!isNaN(d.getTime())) {
+        const p2 = (n) => String(n).padStart(2, '0');
+        expTxt = '（有效至 ' + (d.getMonth() + 1) + '/' + d.getDate() + ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes()) + '）';
+      }
+    }
+    tokenLabel.textContent = 'Token：' + (st.tokenPreview || '已保存') + expTxt;
+    tokenLabel.title = '仅显示脱敏摘要，完整 token 不会回传';
+    btnClearToken.hidden = false;
+  } else {
+    tokenLabel.textContent = 'Token：未设置';
+    btnClearToken.hidden = true;
+  }
 
   if (!st.authorized) {
     statusEl.innerHTML = '<span class="st-err">未授权 · 已保存应用凭证</span>';
@@ -1734,6 +1765,59 @@ async function authorizeFeishu() {
   }
   feishuAuthWindow = window.open(feishuRedirectUri.url, 'feishu_oauth', 'width=560,height=720');
   if (!feishuAuthWindow) alert('请允许浏览器弹出窗口以完成飞书授权');
+}
+
+async function saveFeishuToken() {
+  const accessToken = document.getElementById('feishuAccessToken').value.trim();
+  const refreshToken = document.getElementById('feishuRefreshToken').value.trim();
+  const msg = document.getElementById('feishuTokenMsg');
+  const btn = document.getElementById('btnFeishuSaveToken');
+  msg.hidden = false;
+  msg.classList.remove('tip-err');
+  if (!accessToken) {
+    msg.classList.add('tip-err');
+    msg.textContent = '请填写 access token';
+    return;
+  }
+  btn.disabled = true;
+  msg.textContent = '保存中…';
+  try {
+    const r = await apiSend('POST', '/api/feishu/token', { accessToken, refreshToken });
+    document.getElementById('feishuAccessToken').value = '';
+    document.getElementById('feishuRefreshToken').value = '';
+    if (r.warning) {
+      msg.classList.add('tip-err');
+      msg.textContent = r.warning;
+    } else {
+      msg.textContent = 'Token 已保存' + (r.userName ? '（' + r.userName + '）' : '');
+      document.getElementById('feishuTokenForm').hidden = true;
+    }
+    await refreshFeishuStatus();
+    await loadFeishuTodos(true);
+    render();
+  } catch (e) {
+    msg.classList.add('tip-err');
+    msg.textContent = '保存失败：' + e.message;
+  }
+  btn.disabled = false;
+}
+
+async function clearFeishuToken() {
+  if (!confirm('清除飞书授权？已导入的飞书日历会暂停同步，重新授权后恢复。')) return;
+  const msg = document.getElementById('feishuTokenMsg');
+  msg.hidden = false;
+  msg.classList.remove('tip-err');
+  try {
+    await apiSend('DELETE', '/api/feishu/token');
+    msg.textContent = '已清除授权，可点「授权飞书」重新授权';
+    document.getElementById('feishuTokenForm').hidden = true;
+    await refreshFeishuStatus();
+    await loadFeishuTodos(true);
+    render();
+  } catch (e) {
+    msg.classList.add('tip-err');
+    msg.textContent = '清除失败：' + e.message;
+  }
 }
 
 async function saveFeishuApp() {
@@ -1961,6 +2045,13 @@ function bindEvents() {
 
   // 飞书授权面板
   document.getElementById('btnFeishuAuthorize').addEventListener('click', authorizeFeishu);
+  document.getElementById('btnFeishuTokenEdit').addEventListener('click', () => {
+    const form = document.getElementById('feishuTokenForm');
+    form.hidden = !form.hidden;
+    if (!form.hidden) document.getElementById('feishuAccessToken').focus();
+  });
+  document.getElementById('btnFeishuSaveToken').addEventListener('click', saveFeishuToken);
+  document.getElementById('btnFeishuClearToken').addEventListener('click', clearFeishuToken);
   document.getElementById('btnFeishuSaveApp').addEventListener('click', saveFeishuApp);
   document.getElementById('btnFeishuRefresh').addEventListener('click', refreshFeishuCals);
   // 飞书授权窗口成功回调（window.opener.postMessage）

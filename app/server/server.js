@@ -1210,6 +1210,13 @@ function isWritableCalendar(cal) {
   return !!cal && cal.type === 'feishu' && !!cal.feishuCalendarId;
 }
 
+/** 待办转日程的目标日历：calendarId 指向可写飞书日历时返回该日历，否则 null（写本地） */
+function resolveConvertCalendar(calendarId) {
+  const cid = String(calendarId || '').trim();
+  if (!cid) return null;
+  return loadCalendars().find((c) => c.id === cid && isWritableCalendar(c)) || null;
+}
+
 /* ------------------------------------------------------------------ */
 /* 农历 / 日历数据                                                      */
 /* ------------------------------------------------------------------ */
@@ -1626,21 +1633,27 @@ function handleApi(method, segments, req, res) {
         return readBody(req).then(async (body) => {
           const err = validateEvent(body, false);
           if (err) return sendJson(res, 400, { error: err });
-          const now = new Date().toISOString();
-          const ev = {
-            id: crypto.randomUUID(),
-            title: String(body.title).trim(),
-            start: body.start,
-            end: body.end,
-            allDay: !!body.allDay,
-            color: body.color || 'blue',
-            notes: String(body.notes || ''),
-            createdAt: now,
-            updatedAt: now,
-          };
-          const events = loadEvents();
-          events.push(ev);
-          saveEvents(events);
+          const targetCal = resolveConvertCalendar(body.calendarId);
+          let ev = null;
+          if (targetCal) {
+            await feishuCreateEvent(targetCal, body);
+          } else {
+            const now = new Date().toISOString();
+            ev = {
+              id: crypto.randomUUID(),
+              title: String(body.title).trim(),
+              start: body.start,
+              end: body.end,
+              allDay: !!body.allDay,
+              color: body.color || 'blue',
+              notes: String(body.notes || ''),
+              createdAt: now,
+              updatedAt: now,
+            };
+            const events = loadEvents();
+            events.push(ev);
+            saveEvents(events);
+          }
           let warning = '';
           try {
             await feishuDeleteTask(guid);
@@ -1651,7 +1664,7 @@ function handleApi(method, segments, req, res) {
             }
             warning = msg;
           }
-          return sendJson(res, 200, { todo: null, event: ev, warning });
+          return sendJson(res, 200, { todo: null, event: ev, calendarId: targetCal ? targetCal.id : '', warning });
         }).catch((e) => sendJson(res, 400, { error: e.message }));
       }
 
@@ -1691,30 +1704,36 @@ function handleApi(method, segments, req, res) {
       // POST /api/todos/:id/convert — 待办转日程：创建本地日程并删除该待办
       // 只有「手工勾选完成」的待办才保留在列表里；请求体用日程格式（title/start/end/allDay/notes/color）。
       if (method === 'POST' && segments.length === 3 && segments[2] === 'convert') {
-        return readBody(req).then((body) => {
+        return readBody(req).then(async (body) => {
           const err = validateEvent(body, false);
           if (err) return sendJson(res, 400, { error: err });
           const list = loadTodos();
           const todo = list.find((t) => t.id === id);
           if (!todo) return sendJson(res, 404, { error: 'todo not found' });
-          const now = new Date().toISOString();
-          const ev = {
-            id: crypto.randomUUID(),
-            title: String(body.title).trim(),
-            start: body.start,
-            end: body.end,
-            allDay: !!body.allDay,
-            color: body.color || 'blue',
-            notes: String(body.notes || ''),
-            createdAt: now,
-            updatedAt: now,
-          };
-          const events = loadEvents();
-          events.push(ev);
-          saveEvents(events);
+          const targetCal = resolveConvertCalendar(body.calendarId);
+          let ev = null;
+          if (targetCal) {
+            await feishuCreateEvent(targetCal, body);
+          } else {
+            const now = new Date().toISOString();
+            ev = {
+              id: crypto.randomUUID(),
+              title: String(body.title).trim(),
+              start: body.start,
+              end: body.end,
+              allDay: !!body.allDay,
+              color: body.color || 'blue',
+              notes: String(body.notes || ''),
+              createdAt: now,
+              updatedAt: now,
+            };
+            const events = loadEvents();
+            events.push(ev);
+            saveEvents(events);
+          }
           // 转出去的待办不再保留：只有手工勾选完成的待办才留在列表里
           saveTodos(list.filter((t) => t.id !== id));
-          return sendJson(res, 200, { todo: null, event: ev });
+          return sendJson(res, 200, { todo: null, event: ev, calendarId: targetCal ? targetCal.id : '' });
         }).catch((e) => sendJson(res, 400, { error: e.message }));
       }
     }
@@ -2010,6 +2029,12 @@ function handleApi(method, segments, req, res) {
         configured: !!(cfg.appId && cfg.appSecret),
         authorized: !!cfg.accessToken,
         userName: cfg.userName || '',
+        tokenPreview: cfg.accessToken
+          ? (cfg.accessToken.length > 12
+            ? cfg.accessToken.slice(0, 6) + '…' + cfg.accessToken.slice(-4)
+            : cfg.accessToken.slice(0, 2) + '…')
+          : '',
+        tokenExpiresAt: cfg.tokenExpiresAt || 0,
         calendars: Array.isArray(cfg.calendars) ? cfg.calendars : [],
         scopeHint: FEISHU_SCOPE_HINT,
       });
@@ -2037,6 +2062,52 @@ function handleApi(method, segments, req, res) {
         saveFeishu(cfg);
         return sendJson(res, 200, { ok: true, configured: true, authorized: !!cfg.accessToken });
       }).catch((e) => sendJson(res, 400, { error: e.message }));
+    }
+
+    // POST /api/feishu/token — 手动替换用户 access token（高级用法）
+    // 适用于 token 过期但有新 token、或想切换授权账号；保存后尝试校验并更新用户名
+    if (method === 'POST' && segments[1] === 'token') {
+      return readBody(req).then(async (body) => {
+        const accessToken = String(body.accessToken || '').trim();
+        const refreshToken = String(body.refreshToken || '').trim();
+        if (!accessToken) return sendJson(res, 400, { error: '请填写 access token' });
+        if (accessToken.length < 8) return sendJson(res, 400, { error: 'access token 长度不正确' });
+        const cfg = loadFeishu();
+        cfg.accessToken = accessToken;
+        if (refreshToken) cfg.refreshToken = refreshToken;
+        // 手动 token 的过期时间未知，按飞书 user_access_token 默认 2 小时估算
+        cfg.tokenExpiresAt = Date.now() + 7200 * 1000;
+        // 必须先落盘：feishuUserToken() 会重新 loadFeishu()，否则校验时读到的是旧 token
+        saveFeishu(cfg);
+        let warning = '';
+        try {
+          const info = await feishuUserInfo();
+          cfg.userName = info.name || info.en_name || cfg.userName || '';
+        } catch (e) {
+          warning = 'Token 已保存，但校验失败：' + e.message;
+        }
+        try {
+          cfg.calendars = await feishuListCalendars();
+        } catch (e) { /* 拉不到日历不影响 token 保存，保留旧列表 */ }
+        saveFeishu(cfg);
+        _feishuTasksCache = { key: '', at: 0, tasks: [] };
+        return sendJson(res, 200, {
+          ok: true, authorized: true, userName: cfg.userName || '', warning,
+        });
+      }).catch((e) => sendJson(res, 400, { error: e.message }));
+    }
+
+    // DELETE /api/feishu/token — 清除授权（保留应用凭证），用于换账号或排查授权问题
+    if (method === 'DELETE' && segments[1] === 'token') {
+      const cfg = loadFeishu();
+      cfg.accessToken = '';
+      cfg.refreshToken = '';
+      cfg.tokenExpiresAt = 0;
+      cfg.userName = '';
+      cfg.calendars = [];
+      saveFeishu(cfg);
+      _feishuTasksCache = { key: '', at: 0, tasks: [] };
+      return sendJson(res, 200, { ok: true, authorized: false });
     }
 
     // GET /api/feishu/auth-url — 构造授权链接（需先在飞书开放平台登记回调地址）

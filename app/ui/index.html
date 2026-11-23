@@ -177,6 +177,21 @@
               <button class="btn" id="btnFeishuRefresh" hidden>刷新日历列表</button>
             </div>
           </div>
+          <div class="feishu-token" id="feishuTokenBox" hidden>
+            <div class="feishu-token-head">
+              <span class="feishu-token-label" id="feishuTokenLabel">Token：未设置</span>
+              <button type="button" class="link-btn" id="btnFeishuTokenEdit">修改 Token</button>
+            </div>
+            <div class="feishu-token-form" id="feishuTokenForm" hidden>
+              <input type="password" id="feishuAccessToken" class="input" placeholder="user_access_token（u- 开头）" autocomplete="off" spellcheck="false">
+              <input type="password" id="feishuRefreshToken" class="input" placeholder="refresh_token（可选，用于自动续期）" autocomplete="off" spellcheck="false">
+              <div class="feishu-token-actions">
+                <button type="button" class="btn btn-primary btn-sm" id="btnFeishuSaveToken">保存 Token</button>
+                <button type="button" class="btn btn-sm" id="btnFeishuClearToken">清除授权</button>
+              </div>
+              <div class="feishu-token-msg" id="feishuTokenMsg" hidden></div>
+            </div>
+          </div>
           <div class="feishu-app-config" id="feishuAppConfig" hidden>
             <div class="form-row form-grid">
               <label class="form-label">App ID</label>

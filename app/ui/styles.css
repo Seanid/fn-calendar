@@ -1077,6 +1077,27 @@ body {
   border-radius: 6px; padding: 8px 10px; margin-top: 8px;
 }
 .feishu-tip.tip-err { background: rgba(217, 48, 37, 0.06); color: #b3261e; }
+.feishu-token {
+  margin-top: 8px; padding-top: 8px;
+  border-top: 1px dashed rgba(0, 0, 0, 0.1);
+}
+.feishu-token-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.feishu-token-label {
+  font-size: 12px; color: var(--text-dim); min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.link-btn {
+  border: none; background: transparent; color: var(--accent-blue);
+  font-family: var(--font); font-size: 12px; cursor: pointer;
+  padding: 2px 4px; flex-shrink: 0;
+}
+.link-btn:hover { text-decoration: underline; }
+.feishu-token-form { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.feishu-token-form .input { height: 28px; font-size: 12px; }
+.feishu-token-actions { display: flex; gap: 6px; }
+.feishu-token-actions .btn { font-size: 12px; padding: 4px 10px; }
+.feishu-token-msg { font-size: 11px; line-height: 1.5; color: var(--text-dim); }
+.feishu-token-msg.tip-err { color: #b3261e; }
 .feishu-cal-list {
   margin-top: 8px; max-height: 190px; overflow-y: auto;
   border: 1px solid rgba(0, 0, 0, 0.08); border-radius: 8px;
