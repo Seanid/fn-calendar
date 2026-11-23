@@ -274,7 +274,7 @@ function feishuAuthUrl(cfg, req) {
   const q = new URLSearchParams({
     app_id: cfg.appId,
     redirect_uri: redirectUri,
-    scope: 'calendar:calendar task:task:read',
+    scope: 'calendar:calendar task:task:read task:task:write',
     state: cfg.pendingState,
   });
   return { url: FEISHU_AUTH + '?' + q.toString(), redirectUri };
@@ -282,9 +282,9 @@ function feishuAuthUrl(cfg, req) {
 
 /** 换取日历读写权限所需 scope 说明（引导文案用） */
 const FEISHU_SCOPE_HINT =
-  '请确认飞书开放平台应用已开通权限 calendar:calendar（日历读写）与 task:task:read（查看任务信息）并发布版本；' +
+  '请确认飞书开放平台应用已开通权限 calendar:calendar（日历读写）、task:task:read（查看任务信息）与 task:task:write（删除任务）并发布版本；' +
   '在「安全设置 → 重定向 URL」中登记上方回调地址（与授权弹窗中一致）。' +
-  '旧授权只开了日历权限时需重新授权，才能读取飞书任务。';
+  '旧授权只开了日历权限时需重新授权，才能读取并把飞书任务转为日程。';
 
 /** 拉取当前授权用户可访问的日历列表（含 role/权限） */
 async function feishuListCalendars() {
@@ -374,6 +374,14 @@ async function fetchFeishuTasks(force) {
   const tasks = sortedTodos(out);
   _feishuTasksCache = { key, at: Date.now(), tasks };
   return tasks;
+}
+
+/** 删除飞书任务（转日程后调用），并清空任务缓存使下次列表立即刷新 */
+async function feishuDeleteTask(guid) {
+  const id = String(guid || '');
+  if (!id || id.length > 100 || !/^[\w-]+$/.test(id)) throw new Error('飞书任务 id 无效');
+  await feishuReq('/open-apis/task/v2/tasks/' + encodeURIComponent(id), { method: 'DELETE', auth: 'user' });
+  _feishuTasksCache = { key: '', at: 0, tasks: [] };
 }
 
 /** 飞书日程 JSON → 内部事件（沿用远端 cache 事件结构） */
@@ -1521,7 +1529,7 @@ function handleApi(method, segments, req, res) {
       }).catch((e) => {
         let msg = e.message;
         if (/99991679|permission_violations|Unauthorized/i.test(msg)) {
-          msg += '；请在飞书设置中重新授权，以授予 task:task:read（查看任务信息）权限';
+          msg += '；请在飞书设置中重新授权，以授予 task:task:read（查看任务信息）与 task:task:write（删除任务）权限';
         }
         return sendJson(res, 200, {
           tasks: [],
@@ -1565,6 +1573,42 @@ function handleApi(method, segments, req, res) {
     // 以下接口均针对单个待办：id = segments[1]
     if (segments.length >= 2) {
       const id = segments[1];
+
+      // POST /api/todos/feishu/:id/convert — 飞书任务转日程：创建本地日程并删除飞书任务
+      // id 形如 feishu:<guid>；删除失败不回滚日程，而是在 warning 中提示用户
+      if (method === 'POST' && segments.length === 4 && id === 'feishu' && segments[3] === 'convert') {
+        const guid = String(segments[2] || '').replace(/^feishu:/, '');
+        return readBody(req).then(async (body) => {
+          const err = validateEvent(body, false);
+          if (err) return sendJson(res, 400, { error: err });
+          const now = new Date().toISOString();
+          const ev = {
+            id: crypto.randomUUID(),
+            title: String(body.title).trim(),
+            start: body.start,
+            end: body.end,
+            allDay: !!body.allDay,
+            color: body.color || 'blue',
+            notes: String(body.notes || ''),
+            createdAt: now,
+            updatedAt: now,
+          };
+          const events = loadEvents();
+          events.push(ev);
+          saveEvents(events);
+          let warning = '';
+          try {
+            await feishuDeleteTask(guid);
+          } catch (e) {
+            let msg = e.message;
+            if (/99991679|permission_violations|Unauthorized/i.test(msg)) {
+              msg += '；请在飞书设置中重新授权以授予 task:task:write（删除任务）权限';
+            }
+            warning = msg;
+          }
+          return sendJson(res, 200, { todo: null, event: ev, warning });
+        }).catch((e) => sendJson(res, 400, { error: e.message }));
+      }
 
       // PUT /api/todos/:id — 修改标题/截止日期/备注/完成状态
       if (method === 'PUT' && segments.length === 2) {

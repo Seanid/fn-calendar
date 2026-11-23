@@ -453,7 +453,7 @@ function renderTodoPanel() {
     } else if (state.feishuTodos.length) {
       sourceNote.hidden = false;
       sourceNote.classList.remove('err');
-      sourceNote.textContent = '已接入飞书任务 ' + state.feishuTodos.length + ' 项（只读）';
+      sourceNote.textContent = '已接入飞书任务 ' + state.feishuTodos.length + ' 项（未完成的可转日程）';
     } else {
       sourceNote.hidden = true;
     }
@@ -511,7 +511,14 @@ function renderTodoPanel() {
 
     const actions = el('div', 'todo-actions');
     if (isRemote) {
-      actions.appendChild(el('span', 'todo-remote-hint', '只读'));
+      if (!t.done) {
+        const convBtn = el('button', 'todo-btn todo-btn-convert', '→');
+        convBtn.title = '转为日程并删除飞书任务';
+        convBtn.addEventListener('click', () => todoConvert(t.id, true));
+        actions.appendChild(convBtn);
+      } else {
+        actions.appendChild(el('span', 'todo-remote-hint', '已完成'));
+      }
     } else {
       if (!t.done) {
         const convBtn = el('button', 'todo-btn todo-btn-convert', '→');
@@ -606,12 +613,14 @@ async function todoDelete(t) {
 
 function todoStartEdit(id) { state.todoEditId = id; render(); }
 
-/** 待办转日程：打开日程编辑弹窗并预填（全天、截止日），保存时由后端创建日程并删除该待办 */
-function todoConvert(id) {
-  const t = state.todos.find((x) => x.id === id);
+/** 待办/飞书任务转日程：打开日程编辑弹窗并预填（全天、截止日）；飞书任务保存后同时删除飞书侧任务 */
+function todoConvert(id, isRemote) {
+  const t = isRemote
+    ? (state.feishuTodos || []).find((x) => x.id === id)
+    : state.todos.find((x) => x.id === id);
   if (!t) return;
   const due = parseDate(t.due) || state.selected;
-  openEditor('create', due, undefined, t);
+  openEditor('create', due, undefined, Object.assign({}, t, { source: isRemote ? 'feishu' : 'local' }));
 }
 
 function renderTodayCard() {
@@ -1289,6 +1298,7 @@ function openEditor(mode, arg, startMin, todo) {
     mode, date: base, event: ev,
     todoId: todo ? todo.id : null,
     todoTitle: todo ? todo.title : '',
+    todoSource: todo ? (todo.source || 'local') : null,
   };
   renderEditor();
 }
@@ -1315,7 +1325,9 @@ function renderEditor() {
   const hint = document.getElementById('evHint');
   if (hint) {
     if (ed.todoId) {
-      hint.textContent = '由待办「' + (ed.todoTitle || ev.title) + '」创建日程；保存后该待办将从待办栏删除（手工勾选完成的待办仍会保留）。';
+      hint.textContent = ed.todoSource === 'feishu'
+        ? '由飞书任务「' + (ed.todoTitle || ev.title) + '」创建日程；保存后会同时删除该飞书任务（请确保已授权任务删除权限）。'
+        : '由待办「' + (ed.todoTitle || ev.title) + '」创建日程；保存后该待办将从待办栏删除（手工勾选完成的待办仍会保留）。';
       hint.hidden = false;
     } else if (isEdit && isRecurringInstance(ev)) {
       hint.textContent = '这是重复系列中的其中一次：标题与备注会应用到整个系列；如需调整某一次的时间，请到飞书客户端操作。点击删除将移除整个系列。';
@@ -1442,13 +1454,25 @@ async function saveEditor() {
         await apiSend('PUT', '/api/events/' + ev.id, ev);
       }
     } else {
-      // 待办转日程：后端创建本地日程并把待办标记为已完成（弹窗中已可修改标题/时间）
+      // 待办/飞书任务转日程：后端创建本地日程并删除来源（弹窗中已可修改标题/时间）
       if (state.editing.todoId) {
         const todoTitle = state.editing.todoTitle || ev.title;
-        await apiSend('POST', '/api/todos/' + encodeURIComponent(state.editing.todoId) + '/convert', ev);
+        const isFeishu = state.editing.todoSource === 'feishu';
+        const path = isFeishu
+          ? '/api/todos/feishu/' + encodeURIComponent(state.editing.todoId) + '/convert'
+          : '/api/todos/' + encodeURIComponent(state.editing.todoId) + '/convert';
+        const result = await apiSend('POST', path, ev);
         closeEditor();
         await refreshAll();
-        showTodoNotice('「' + todoTitle + '」已转为日程，待办已删除');
+        if (isFeishu) {
+          await loadFeishuTodos(true);
+          render();
+        }
+        if (result && result.warning) {
+          showTodoNotice('「' + todoTitle + '」已转为日程，但飞书任务删除失败：' + result.warning);
+        } else {
+          showTodoNotice('「' + todoTitle + '」已转为日程，' + (isFeishu ? '飞书任务已删除' : '待办已删除'));
+        }
         return;
       }
       // 新建：按下拉「日历」选择路由 —— cal:<id> 写回飞书日历，local 写入本地
