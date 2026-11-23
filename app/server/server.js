@@ -27,6 +27,7 @@ const UI_DIR = process.env.UI_DIR || path.join(__dirname, '..', 'ui');
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'var');
 const EVENTS_FILE = path.join(DATA_DIR, 'events.json');
 const CALENDARS_FILE = path.join(DATA_DIR, 'calendars.json');
+const TODOS_FILE = path.join(DATA_DIR, 'todos.json');
 const FEISHU_FILE = path.join(DATA_DIR, 'feishu.json');
 const CACHE_DIR = path.join(DATA_DIR, 'cache');
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -84,6 +85,63 @@ function saveCalendars(list) {
   } catch (e) {
     console.error('[fn-calendar] 保存日历源失败:', e.message);
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* 待办任务（JSON 文件持久化，与 events.json 同目录，升级数据保留）        */
+/* ------------------------------------------------------------------ */
+
+function loadTodos() {
+  try {
+    if (fs.existsSync(TODOS_FILE)) {
+      const list = JSON.parse(fs.readFileSync(TODOS_FILE, 'utf8'));
+      return Array.isArray(list) ? list : [];
+    }
+  } catch (e) {
+    console.error('[fn-calendar] 读取待办数据失败:', e.message);
+  }
+  return [];
+}
+
+function saveTodos(list) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const tmp = TODOS_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(list, null, 2), 'utf8');
+    fs.renameSync(tmp, TODOS_FILE);
+  } catch (e) {
+    console.error('[fn-calendar] 保存待办数据失败:', e.message);
+  }
+}
+
+/** 待办列表顺序：未完成优先 → 截止日期近的优先（无日期靠后）→ 完成时间倒序 */
+function sortedTodos(list) {
+  return list.slice().sort((a, b) => {
+    if (!!a.done !== !!b.done) return a.done ? 1 : -1;
+    if (!a.done) {
+      const ad = a.due || '9999-12-31';
+      const bd = b.due || '9999-12-31';
+      if (ad !== bd) return ad.localeCompare(bd);
+      return String(b.createdAt || '').localeCompare(String(a.createdAt || ''));
+    }
+    return String(b.completedAt || b.updatedAt || '').localeCompare(String(a.completedAt || a.updatedAt || ''));
+  });
+}
+
+/** 校验/规范化待办字段，返回错误消息或 null；规范化结果写回 body */
+function validateTodo(body, isUpdate) {
+  if (!body || typeof body !== 'object') return '请求内容无效';
+  if (!isUpdate || body.title !== undefined) {
+    if (!body.title || !String(body.title).trim()) return '待办标题不能为空';
+    if (String(body.title).trim().length > 200) return '待办标题不能超过 200 字';
+  }
+  if (body.due !== undefined) {
+    const due = String(body.due || '').trim();
+    if (due && !parseDate(due)) return '截止日期格式无效（应为 YYYY-MM-DD）';
+    body.due = due;
+  }
+  if (body.notes !== undefined) body.notes = String(body.notes || '');
+  return null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1371,6 +1429,111 @@ function handleApi(method, segments, req, res) {
         saveEvents(events);
         return sendJson(res, 200, merged);
       }).catch((e) => sendJson(res, 400, { error: e.message }));
+    }
+    return sendJson(res, 404, { error: 'not found' });
+  }
+
+  /* -------- 待办任务 -------- */
+
+  if (segments[0] === 'todos') {
+    // GET /api/todos — 全部待办（未完成优先、截止日期近的优先）
+    if (method === 'GET' && segments.length === 1) {
+      return sendJson(res, 200, sortedTodos(loadTodos()));
+    }
+
+    // POST /api/todos — 新增待办
+    if (method === 'POST' && segments.length === 1) {
+      return readBody(req).then((body) => {
+        const err = validateTodo(body, false);
+        if (err) return sendJson(res, 400, { error: err });
+        const now = new Date().toISOString();
+        const todo = {
+          id: crypto.randomUUID(),
+          title: String(body.title).trim(),
+          notes: String(body.notes || ''),
+          due: String(body.due || ''),
+          done: false,
+          createdAt: now,
+          updatedAt: now,
+          completedAt: '',
+          eventId: '',
+        };
+        const list = loadTodos();
+        list.push(todo);
+        saveTodos(list);
+        return sendJson(res, 200, todo);
+      }).catch((e) => sendJson(res, 400, { error: e.message }));
+    }
+
+    // 以下接口均针对单个待办：id = segments[1]
+    if (segments.length >= 2) {
+      const id = segments[1];
+
+      // PUT /api/todos/:id — 修改标题/截止日期/备注/完成状态
+      if (method === 'PUT' && segments.length === 2) {
+        return readBody(req).then((body) => {
+          const list = loadTodos();
+          const idx = list.findIndex((t) => t.id === id);
+          if (idx < 0) return sendJson(res, 404, { error: 'todo not found' });
+          const err = validateTodo(body, true);
+          if (err) return sendJson(res, 400, { error: err });
+          const todo = list[idx];
+          const wasDone = !!todo.done;
+          if (body.title !== undefined) todo.title = String(body.title).trim();
+          if (body.notes !== undefined) todo.notes = String(body.notes || '');
+          if (body.due !== undefined) todo.due = String(body.due || '');
+          if (body.done !== undefined) todo.done = !!body.done;
+          if (todo.done !== wasDone) {
+            todo.completedAt = todo.done ? new Date().toISOString() : '';
+          }
+          todo.updatedAt = new Date().toISOString();
+          saveTodos(list);
+          return sendJson(res, 200, todo);
+        }).catch((e) => sendJson(res, 400, { error: e.message }));
+      }
+
+      // DELETE /api/todos/:id
+      if (method === 'DELETE' && segments.length === 2) {
+        const list = loadTodos();
+        const idx = list.findIndex((t) => t.id === id);
+        if (idx < 0) return sendJson(res, 404, { error: 'todo not found' });
+        list.splice(idx, 1);
+        saveTodos(list);
+        return sendJson(res, 200, { ok: true });
+      }
+
+      // POST /api/todos/:id/convert — 待办转日程：创建本地日程并把待办标记为已完成
+      // 请求体使用日程格式（title/start/end/allDay/notes/color），用户可在弹窗里改好再确认。
+      if (method === 'POST' && segments.length === 3 && segments[2] === 'convert') {
+        return readBody(req).then((body) => {
+          const err = validateEvent(body, false);
+          if (err) return sendJson(res, 400, { error: err });
+          const list = loadTodos();
+          const todo = list.find((t) => t.id === id);
+          if (!todo) return sendJson(res, 404, { error: 'todo not found' });
+          const now = new Date().toISOString();
+          const ev = {
+            id: crypto.randomUUID(),
+            title: String(body.title).trim(),
+            start: body.start,
+            end: body.end,
+            allDay: !!body.allDay,
+            color: body.color || 'blue',
+            notes: String(body.notes || ''),
+            createdAt: now,
+            updatedAt: now,
+          };
+          const events = loadEvents();
+          events.push(ev);
+          saveEvents(events);
+          todo.done = true;
+          todo.completedAt = now;
+          todo.updatedAt = now;
+          todo.eventId = ev.id;
+          saveTodos(list);
+          return sendJson(res, 200, { todo, event: ev });
+        }).catch((e) => sendJson(res, 400, { error: e.message }));
+      }
     }
     return sendJson(res, 404, { error: 'not found' });
   }

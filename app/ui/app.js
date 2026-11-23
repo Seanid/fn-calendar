@@ -41,6 +41,10 @@ const state = {
   syncedThisSession: false,
   dragEv: null,             // 正在拖拽改期的日程
   dragGrabMin: 0,           // 按住点相对事件块顶部的分钟偏移（还原抓取位置）
+  todos: [],                // 右侧待办任务
+  todoFilter: 'active',     // active | done | all
+  todoEditId: null,         // 正在进行行内编辑的待办 id
+  todoNoticeTimer: null,
 };
 
 /* ---------------- API 助手 ---------------- */
@@ -140,7 +144,7 @@ function clear(node) { node.textContent = ''; }
 /* ---------------- 数据加载 ---------------- */
 
 async function refreshAll() {
-  const tasks = [loadCalendars(), loadToday()];
+  const tasks = [loadCalendars(), loadToday(), loadTodos()];
   if (state.view === 'month') {
     tasks.push(loadMonth());
   } else if (state.view === 'year') {
@@ -255,6 +259,7 @@ async function loadToday() {
 function render() {
   renderToolbar();
   renderSidebar();
+  renderTodoPanel();
   const area = document.getElementById('mainArea');
   clear(area);
   if (state.view === 'month') renderMonthView(area);
@@ -356,6 +361,195 @@ function renderRemoteCalList() {
     item.appendChild(actions);
     wrap.appendChild(item);
   });
+}
+
+/* ---------------- 右侧待办栏 ---------------- */
+
+async function loadTodos() {
+  try {
+    state.todos = await apiGet('/api/todos');
+  } catch (e) {
+    state.todos = [];
+  }
+}
+
+function showTodoNotice(msg) {
+  const n = document.getElementById('todoNotice');
+  if (!n) return;
+  n.textContent = msg;
+  n.hidden = false;
+  if (state.todoNoticeTimer) clearTimeout(state.todoNoticeTimer);
+  state.todoNoticeTimer = setTimeout(() => { n.hidden = true; }, 5000);
+}
+
+function applyTodoVisibility(show, remember) {
+  const panel = document.getElementById('todoPanel');
+  if (!panel) return;
+  panel.hidden = !show;
+  const btn = document.getElementById('btnTodoToggle');
+  if (btn) btn.classList.toggle('btn-primary', !show); // 收起时高亮按钮，提示可点开
+  if (remember) localStorage.setItem('fnCalTodoVisible', show ? '1' : '0');
+}
+
+function toggleTodoPanel() {
+  const panel = document.getElementById('todoPanel');
+  applyTodoVisibility(!!panel.hidden, true);
+}
+
+function visibleTodos() {
+  const list = state.todos.slice();
+  if (state.todoFilter === 'active') return list.filter((t) => !t.done);
+  if (state.todoFilter === 'done') return list.filter((t) => t.done);
+  return list;
+}
+
+function renderTodoPanel() {
+  const listEl = document.getElementById('todoList');
+  if (!listEl) return;
+  const active = state.todos.filter((t) => !t.done).length;
+  document.getElementById('todoCount').textContent = active ? '· ' + active : '';
+  document.querySelectorAll('#todoFilters button').forEach((b) => {
+    b.classList.toggle('active', b.dataset.filter === state.todoFilter);
+  });
+  clear(listEl);
+  const todos = visibleTodos();
+  if (!todos.length) {
+    listEl.appendChild(el('div', 'todo-empty', '暂无待办，添加一个吧'));
+    return;
+  }
+  const todayStr = fmtDate(new Date());
+  todos.forEach((t) => {
+    if (state.todoEditId === t.id) {
+      listEl.appendChild(buildTodoEditRow(t));
+      return;
+    }
+    const item = el('div', 'todo-item' + (t.done ? ' done' : ''));
+    const main = el('div', 'todo-main');
+    const cb = el('input');
+    cb.type = 'checkbox';
+    cb.className = 'todo-check';
+    cb.checked = !!t.done;
+    cb.title = t.done ? '标记为未完成' : '标记为已完成';
+    cb.addEventListener('change', () => todoSetDone(t.id, cb.checked));
+    const body = el('div', 'todo-body');
+    const text = el('div', 'todo-text', t.title);
+    text.title = t.title + '（点击编辑）';
+    text.addEventListener('click', () => todoStartEdit(t.id));
+    body.appendChild(text);
+    const meta = el('div', 'todo-meta');
+    if (t.due) {
+      const due = el('span', 'todo-due' + (!t.done && t.due < todayStr ? ' overdue' : ''), '截止 ' + t.due.slice(5));
+      due.title = '截止日期：' + t.due;
+      meta.appendChild(due);
+    }
+    if (t.done && t.eventId) {
+      const conv = el('span', 'todo-conv', '✓ 已转日程');
+      conv.title = '已关联日程，可在日历中查看';
+      meta.appendChild(conv);
+    }
+    if (meta.childElementCount) body.appendChild(meta);
+    main.append(cb, body);
+    item.appendChild(main);
+
+    const actions = el('div', 'todo-actions');
+    if (!t.done) {
+      const convBtn = el('button', 'todo-btn todo-btn-convert', '→');
+      convBtn.title = '转为日程';
+      convBtn.addEventListener('click', () => todoConvert(t.id));
+      actions.appendChild(convBtn);
+    }
+    const editBtn = el('button', 'todo-btn', '✎');
+    editBtn.title = '编辑待办';
+    editBtn.addEventListener('click', () => todoStartEdit(t.id));
+    const delBtn = el('button', 'todo-btn todo-btn-del', '×');
+    delBtn.title = '删除待办';
+    delBtn.addEventListener('click', () => todoDelete(t));
+    actions.append(editBtn, delBtn);
+    item.appendChild(actions);
+    listEl.appendChild(item);
+  });
+}
+
+function buildTodoEditRow(t) {
+  const item = el('div', 'todo-item editing');
+  const title = el('input', 'input todo-edit-title');
+  title.value = t.title;
+  title.maxLength = 200;
+  const due = el('input', 'input todo-edit-due');
+  due.type = 'date';
+  due.value = t.due || '';
+  const err = el('div', 'todo-error');
+  const actions = el('div', 'todo-edit-actions');
+  const save = el('button', 'btn btn-primary btn-sm', '保存');
+  const cancel = el('button', 'btn btn-sm', '取消');
+  save.addEventListener('click', async () => {
+    const v = title.value.trim();
+    if (!v) { err.textContent = '请输入待办标题'; return; }
+    save.disabled = true;
+    try {
+      await apiSend('PUT', '/api/todos/' + encodeURIComponent(t.id), { title: v, due: due.value || '' });
+      state.todoEditId = null;
+      await loadTodos();
+      render();
+    } catch (ex) { err.textContent = ex.message; save.disabled = false; }
+  });
+  cancel.addEventListener('click', () => { state.todoEditId = null; render(); });
+  title.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') save.click();
+    if (e.key === 'Escape') cancel.click();
+  });
+  actions.append(cancel, save);
+  item.append(title, due, err, actions);
+  setTimeout(() => title.focus(), 0);
+  return item;
+}
+
+async function todoAdd() {
+  const input = document.getElementById('todoInput');
+  const dueEl = document.getElementById('todoDue');
+  const err = document.getElementById('todoError');
+  const title = input.value.trim();
+  if (!title) { err.textContent = '请输入待办标题'; input.focus(); return; }
+  const btn = document.getElementById('btnTodoAdd');
+  btn.disabled = true; err.textContent = '';
+  try {
+    await apiSend('POST', '/api/todos', { title, due: dueEl.value || '' });
+    input.value = ''; dueEl.value = '';
+    state.todoFilter = 'active';
+    state.todoEditId = null;
+    await loadTodos();
+    render();
+    input.focus();
+  } catch (ex) { err.textContent = ex.message; }
+  btn.disabled = false;
+}
+
+async function todoSetDone(id, done) {
+  try {
+    await apiSend('PUT', '/api/todos/' + encodeURIComponent(id), { done });
+    await loadTodos();
+    render();
+  } catch (ex) { alert('更新待办失败：' + ex.message); }
+}
+
+async function todoDelete(t) {
+  if (!confirm('删除待办「' + t.title + '」？')) return;
+  try {
+    await apiSend('DELETE', '/api/todos/' + encodeURIComponent(t.id));
+    if (state.todoEditId === t.id) state.todoEditId = null;
+    await loadTodos();
+    render();
+  } catch (ex) { alert('删除待办失败：' + ex.message); }
+}
+
+function todoStartEdit(id) { state.todoEditId = id; render(); }
+
+/** 待办转日程：打开日程编辑弹窗并预填（全天、截止日），保存时由后端创建日程并标记待办完成 */
+function todoConvert(id) {
+  const t = state.todos.find((x) => x.id === id);
+  if (!t) return;
+  const due = parseDate(t.due) || state.selected;
+  openEditor('create', due, undefined, t);
 }
 
 function renderTodayCard() {
@@ -994,7 +1188,7 @@ function navigate(delta) {
 let modalGuardUntil = 0;
 const MODAL_GUARD_MS = 500;
 
-function openEditor(mode, arg, startMin) {
+function openEditor(mode, arg, startMin, todo) {
   if (mode === 'edit') {
     // arg 为要编辑的日程对象；original 为打开时的快照（保存时用于判断是否变更了时间）
     state.editing = { mode, event: Object.assign({}, arg), original: Object.assign({}, arg) };
@@ -1020,7 +1214,20 @@ function openEditor(mode, arg, startMin) {
     color: 'blue',
     notes: '',
   };
-  state.editing = { mode, date: base, event: ev };
+  // 由右侧待办转入：标题/备注预填，截止日作为全天日程的起止日（可在弹窗中继续修改）
+  if (todo) {
+    ev.title = todo.title || '';
+    ev.notes = todo.notes || '';
+    ev.allDay = true;
+    ev.start = fmtDate(base);
+    ev.end = fmtDate(base);
+    ev.color = 'orange';
+  }
+  state.editing = {
+    mode, date: base, event: ev,
+    todoId: todo ? todo.id : null,
+    todoTitle: todo ? todo.title : '',
+  };
   renderEditor();
 }
 
@@ -1034,7 +1241,7 @@ function renderEditor() {
 
   document.getElementById('modalTitle').textContent = isView
     ? '日程详情（' + (ev.calendarName || '远程') + '）'
-    : (isEdit ? (isRecurringInstance(ev) ? '编辑日程（作用于整个系列）' : '编辑日程') : '新建日程');
+    : (isEdit ? (isRecurringInstance(ev) ? '编辑日程（作用于整个系列）' : '编辑日程') : (ed.todoId ? '由待办转为日程' : '新建日程'));
   document.getElementById('evTitle').value = ev.title || '';
   document.getElementById('evTitle').disabled = isView;
   document.getElementById('btnDelete').hidden = !isEdit;
@@ -1045,7 +1252,10 @@ function renderEditor() {
   // 顶部提示条：重复系列实例只能改文本（时间/全天锁定），删除=删除整体系列
   const hint = document.getElementById('evHint');
   if (hint) {
-    if (isEdit && isRecurringInstance(ev)) {
+    if (ed.todoId) {
+      hint.textContent = '由待办「' + (ed.todoTitle || ev.title) + '」创建日程；保存后该待办会标记为已完成，并在待办栏显示「已转日程」。';
+      hint.hidden = false;
+    } else if (isEdit && isRecurringInstance(ev)) {
       hint.textContent = '这是重复系列中的其中一次：标题与备注会应用到整个系列；如需调整某一次的时间，请到飞书客户端操作。点击删除将移除整个系列。';
       hint.hidden = false;
     } else {
@@ -1053,9 +1263,9 @@ function renderEditor() {
     }
   }
 
-  // 日历选择（仅新建模式）：本地「个人」或已导入的飞书日历
+  // 日历选择（仅新建模式）：本地「个人」或已导入的飞书日历。待办转日程固定写入本地日历
   const calRow = document.getElementById('evCalRow');
-  if (!isView && !isEdit) {
+  if (!isView && !isEdit && !ed.todoId) {
     calRow.hidden = false;
     const sel = document.getElementById('evCalendar');
     clear(sel);
@@ -1170,6 +1380,15 @@ async function saveEditor() {
         await apiSend('PUT', '/api/events/' + ev.id, ev);
       }
     } else {
+      // 待办转日程：后端创建本地日程并把待办标记为已完成（弹窗中已可修改标题/时间）
+      if (state.editing.todoId) {
+        const todoTitle = state.editing.todoTitle || ev.title;
+        await apiSend('POST', '/api/todos/' + encodeURIComponent(state.editing.todoId) + '/convert', ev);
+        closeEditor();
+        await refreshAll();
+        showTodoNotice('「' + todoTitle + '」已转为日程');
+        return;
+      }
       // 新建：按下拉「日历」选择路由 —— cal:<id> 写回飞书日历，local 写入本地
       const calSel = document.getElementById('evCalendar');
       const target = calSel ? calSel.value : 'local';
@@ -1598,6 +1817,21 @@ function bindEvents() {
     openEditor('create', state.selected);
   });
 
+  // 右侧待办栏
+  document.getElementById('btnTodoToggle').addEventListener('click', toggleTodoPanel);
+  document.getElementById('btnTodoCollapse').addEventListener('click', () => applyTodoVisibility(false, true));
+  document.getElementById('btnTodoAdd').addEventListener('click', todoAdd);
+  document.getElementById('todoInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') todoAdd();
+  });
+  document.querySelectorAll('#todoFilters button').forEach((b) => {
+    b.addEventListener('click', () => {
+      state.todoFilter = b.dataset.filter;
+      state.todoEditId = null;
+      render();
+    });
+  });
+
   // 添加日历源（CalDAV / ICS / 飞书）——必须箭头包装，避免把 MouseEvent 当成 cal（否则误入编辑模式）
   document.getElementById('btnAddList').addEventListener('click', () => openCalModal());
   document.getElementById('btnCalModalClose').addEventListener('click', closeCalModal);
@@ -1647,6 +1881,7 @@ function bindEvents() {
 
 async function init() {
   bindEvents();
+  applyTodoVisibility(localStorage.getItem('fnCalTodoVisible') !== '0', false);
   await loadCalendars();
   await refreshAll();
   backgroundSync();
