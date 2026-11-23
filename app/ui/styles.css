@@ -1266,6 +1266,29 @@ body {
 .todo-edit-actions .btn { height: 23px; font-size: 12px; padding: 0 10px; }
 .todo-empty { color: var(--text-faint); font-size: 12px; text-align: center; padding: 22px 8px; }
 
+/* 飞书任务（只读展示，与本地待办共用列表） */
+.todo-head-actions { display: flex; gap: 1px; }
+.todo-collapse.spinning { animation: todo-spin 1s linear infinite; }
+@keyframes todo-spin { to { transform: rotate(360deg); } }
+.todo-source-note {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 7px 10px 0;
+  line-height: 1.4;
+}
+.todo-source-note.err { color: var(--today-red); }
+.todo-item.remote { background: #f5f8fd; }
+.todo-src-badge {
+  font-size: 10px;
+  color: #3370ff;
+  border: 1px solid rgba(51, 112, 255, .3);
+  border-radius: 3px;
+  padding: 0 4px;
+  line-height: 15px;
+}
+.todo-check:disabled { cursor: default; }
+.todo-remote-hint { font-size: 10.5px; color: var(--text-faint); line-height: 22px; margin-right: 2px; }
+
 @media (max-width: 1100px) { :root { --todo-w: 224px; } }
 @media (max-width: 820px) { :root { --todo-w: 190px; } }
 

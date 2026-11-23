@@ -71,7 +71,10 @@
       <aside class="todo-panel" id="todoPanel">
         <div class="todo-head">
           <span class="todo-heading">待办 <span class="todo-count" id="todoCount"></span></span>
-          <button class="todo-collapse" id="btnTodoCollapse" title="收起待办栏">×</button>
+          <span class="todo-head-actions">
+            <button class="todo-collapse" id="btnFeishuTaskRefresh" title="刷新飞书任务">⟳</button>
+            <button class="todo-collapse" id="btnTodoCollapse" title="收起待办栏">×</button>
+          </span>
         </div>
         <div class="todo-composer">
           <input type="text" id="todoInput" class="input todo-input" placeholder="添加待办任务…" maxlength="200">
@@ -86,6 +89,7 @@
           <button data-filter="done">已完成</button>
           <button data-filter="all">全部</button>
         </div>
+        <div class="todo-source-note" id="todoSourceNote" hidden></div>
         <div class="todo-notice" id="todoNotice" hidden></div>
         <div class="todo-list" id="todoList"></div>
       </aside>

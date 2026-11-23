@@ -274,7 +274,7 @@ function feishuAuthUrl(cfg, req) {
   const q = new URLSearchParams({
     app_id: cfg.appId,
     redirect_uri: redirectUri,
-    scope: 'calendar:calendar',
+    scope: 'calendar:calendar task:task:read',
     state: cfg.pendingState,
   });
   return { url: FEISHU_AUTH + '?' + q.toString(), redirectUri };
@@ -282,8 +282,9 @@ function feishuAuthUrl(cfg, req) {
 
 /** 换取日历读写权限所需 scope 说明（引导文案用） */
 const FEISHU_SCOPE_HINT =
-  '请确认飞书开放平台应用已开通权限 calendar:calendar（读写）并发布版本；' +
-  '在「安全设置 → 重定向 URL」中登记上方回调地址（与授权弹窗中一致）。';
+  '请确认飞书开放平台应用已开通权限 calendar:calendar（日历读写）与 task:task:read（查看任务信息）并发布版本；' +
+  '在「安全设置 → 重定向 URL」中登记上方回调地址（与授权弹窗中一致）。' +
+  '旧授权只开了日历权限时需重新授权，才能读取飞书任务。';
 
 /** 拉取当前授权用户可访问的日历列表（含 role/权限） */
 async function feishuListCalendars() {
@@ -305,6 +306,74 @@ async function feishuListCalendars() {
     else break;
   }
   return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* 飞书任务（与日历共用 user_access_token；在右侧待办栏只读展示）          */
+/* ------------------------------------------------------------------ */
+
+/** 飞书任务 v2（guid/completed_at/due.timestamp，毫秒）→ 待办展示结构 */
+function feishuTaskToTodo(t) {
+  const p2 = (n) => String(n).padStart(2, '0');
+  const id = String(t.guid || t.task_id || '');
+  const dueRaw = t.due || {};
+  const dueNum = Number(dueRaw.timestamp || dueRaw.time || 0);
+  let due = '';
+  if (dueNum > 0) {
+    // v2 timestamp 为毫秒；v1 time 为秒 —— 按量级区分，兼容两种回包
+    const d = new Date(dueNum > 1e12 ? dueNum : dueNum * 1000);
+    if (!isNaN(d.getTime())) due = `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+  }
+  const iso = (v) => {
+    const n = Number(v || 0);
+    if (!n) return '';
+    const d = new Date(n > 1e12 ? n : n * 1000);
+    return isNaN(d.getTime()) ? '' : d.toISOString();
+  };
+  const doneNum = Number(t.completed_at || t.complete_time || 0);
+  return {
+    id: 'feishu:' + id,
+    source: 'feishu',
+    title: String(t.summary || '(无标题飞书任务)'),
+    notes: String(t.description || ''),
+    due,
+    done: doneNum > 0,
+    createdAt: iso(t.created_at || t.create_time),
+    updatedAt: iso(t.updated_at || t.update_time),
+    completedAt: iso(t.completed_at || t.complete_time),
+    eventId: '',
+  };
+}
+
+// 任务列表短期缓存：导航/刷新页面不会每次都打飞书接口；⟳ 按钮可强制刷新
+let _feishuTasksCache = { key: '', at: 0, tasks: [] };
+const FEISHU_TASKS_TTL = 60000;
+
+/** 使用与日历相同的 user_access_token 分页拉取飞书「我负责的」任务 */
+async function fetchFeishuTasks(force) {
+  const cfg = loadFeishu();
+  if (!cfg.appId || !cfg.appSecret) throw new Error('尚未配置飞书应用凭证');
+  if (!cfg.accessToken) throw new Error('尚未授权飞书账号，请先在「添加日历 → 飞书日历」中授权');
+  const key = cfg.accessToken;
+  if (!force && _feishuTasksCache.key === key && Date.now() - _feishuTasksCache.at < FEISHU_TASKS_TTL) {
+    return _feishuTasksCache.tasks;
+  }
+  const out = [];
+  let pageToken = '';
+  for (let guard = 0; guard < 20; guard++) {
+    const q = new URLSearchParams({ page_size: '100', type: 'my_tasks' });
+    if (pageToken) q.set('page_token', pageToken);
+    const data = await feishuReq('/open-apis/task/v2/tasks?' + q.toString(), { auth: 'user' });
+    for (const t of data.items || []) {
+      const todo = feishuTaskToTodo(t);
+      if (todo.id !== 'feishu:') out.push(todo);
+    }
+    if (data.has_more && data.page_token) pageToken = data.page_token;
+    else break;
+  }
+  const tasks = sortedTodos(out);
+  _feishuTasksCache = { key, at: Date.now(), tasks };
+  return tasks;
 }
 
 /** 飞书日程 JSON → 内部事件（沿用远端 cache 事件结构） */
@@ -1436,6 +1505,34 @@ function handleApi(method, segments, req, res) {
   /* -------- 待办任务 -------- */
 
   if (segments[0] === 'todos') {
+    // GET /api/todos/feishu?refresh=1 — 飞书任务（复用日历授权 token，只读）
+    // 未授权/权限不足不返回错误码，而是带 error 字段的 200，前端只展示一行提示，不打断本地待办
+    if (method === 'GET' && segments.length === 2 && segments[1] === 'feishu') {
+      const cfg = loadFeishu();
+      const params = new URL(req.url, 'http://x').searchParams;
+      return Promise.resolve().then(() => fetchFeishuTasks(params.get('refresh') === '1')).then((tasks) => {
+        return sendJson(res, 200, {
+          tasks,
+          configured: !!(cfg.appId && cfg.appSecret),
+          authorized: !!cfg.accessToken,
+          syncedAt: new Date().toISOString(),
+          error: '',
+        });
+      }).catch((e) => {
+        let msg = e.message;
+        if (/99991679|permission_violations|Unauthorized/i.test(msg)) {
+          msg += '；请在飞书设置中重新授权，以授予 task:task:read（查看任务信息）权限';
+        }
+        return sendJson(res, 200, {
+          tasks: [],
+          configured: !!(cfg.appId && cfg.appSecret),
+          authorized: !!cfg.accessToken,
+          syncedAt: '',
+          error: msg,
+        });
+      });
+    }
+
     // GET /api/todos — 全部待办（未完成优先、截止日期近的优先）
     if (method === 'GET' && segments.length === 1) {
       return sendJson(res, 200, sortedTodos(loadTodos()));
@@ -1502,8 +1599,8 @@ function handleApi(method, segments, req, res) {
         return sendJson(res, 200, { ok: true });
       }
 
-      // POST /api/todos/:id/convert — 待办转日程：创建本地日程并把待办标记为已完成
-      // 请求体使用日程格式（title/start/end/allDay/notes/color），用户可在弹窗里改好再确认。
+      // POST /api/todos/:id/convert — 待办转日程：创建本地日程并删除该待办
+      // 只有「手工勾选完成」的待办才保留在列表里；请求体用日程格式（title/start/end/allDay/notes/color）。
       if (method === 'POST' && segments.length === 3 && segments[2] === 'convert') {
         return readBody(req).then((body) => {
           const err = validateEvent(body, false);
@@ -1526,12 +1623,9 @@ function handleApi(method, segments, req, res) {
           const events = loadEvents();
           events.push(ev);
           saveEvents(events);
-          todo.done = true;
-          todo.completedAt = now;
-          todo.updatedAt = now;
-          todo.eventId = ev.id;
-          saveTodos(list);
-          return sendJson(res, 200, { todo, event: ev });
+          // 转出去的待办不再保留：只有手工勾选完成的待办才留在列表里
+          saveTodos(list.filter((t) => t.id !== id));
+          return sendJson(res, 200, { todo: null, event: ev });
         }).catch((e) => sendJson(res, 400, { error: e.message }));
       }
     }
