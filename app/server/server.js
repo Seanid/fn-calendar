@@ -358,18 +358,13 @@ async function fetchFeishuTasks(force) {
   if (!force && _feishuTasksCache.key === key && Date.now() - _feishuTasksCache.at < FEISHU_TASKS_TTL) {
     return _feishuTasksCache.tasks;
   }
+  // 只取前 100 条：task/v2 单页上限 100，取够即止，不再翻页（避免任务多时反复打飞书接口）
+  const q = new URLSearchParams({ page_size: '100', type: 'my_tasks' });
+  const data = await feishuReq('/open-apis/task/v2/tasks?' + q.toString(), { auth: 'user' });
   const out = [];
-  let pageToken = '';
-  for (let guard = 0; guard < 20; guard++) {
-    const q = new URLSearchParams({ page_size: '100', type: 'my_tasks' });
-    if (pageToken) q.set('page_token', pageToken);
-    const data = await feishuReq('/open-apis/task/v2/tasks?' + q.toString(), { auth: 'user' });
-    for (const t of data.items || []) {
-      const todo = feishuTaskToTodo(t);
-      if (todo.id !== 'feishu:') out.push(todo);
-    }
-    if (data.has_more && data.page_token) pageToken = data.page_token;
-    else break;
+  for (const t of (data.items || []).slice(0, 100)) {
+    const todo = feishuTaskToTodo(t);
+    if (todo.id !== 'feishu:') out.push(todo);
   }
   const tasks = sortedTodos(out);
   _feishuTasksCache = { key, at: Date.now(), tasks };
@@ -398,6 +393,25 @@ async function feishuDeleteTask(guid) {
   const id = String(guid || '');
   if (!id || id.length > 100 || !/^[\w-]+$/.test(id)) throw new Error('飞书任务 id 无效');
   await feishuReq('/open-apis/task/v2/tasks/' + encodeURIComponent(id), { method: 'DELETE', auth: 'user' });
+  _feishuTasksCache = { key: '', at: 0, tasks: [] };
+}
+
+/**
+ * 勾选/取消勾选飞书任务。
+ * 飞书用 PATCH /task/v2/tasks/:guid 改 completed_at：传毫秒时间戳=完成，传 "0"=恢复未完成；
+ * 且必须用 update_fields 显式声明要改的字段，否则请求不生效。
+ */
+async function feishuSetTaskDone(guid, done) {
+  const id = String(guid || '');
+  if (!id || id.length > 100 || !/^[\w-]+$/.test(id)) throw new Error('飞书任务 id 无效');
+  await feishuReq('/open-apis/task/v2/tasks/' + encodeURIComponent(id), {
+    method: 'PATCH',
+    auth: 'user',
+    body: {
+      task: { completed_at: done ? String(Date.now()) : '0' },
+      update_fields: ['completed_at'],
+    },
+  });
   _feishuTasksCache = { key: '', at: 0, tasks: [] };
 }
 
@@ -1631,6 +1645,24 @@ function handleApi(method, segments, req, res) {
     // 以下接口均针对单个待办：id = segments[1]
     if (segments.length >= 2) {
       const id = segments[1];
+
+      // PUT /api/todos/feishu/:id — 勾选/取消勾选飞书任务（id 形如 feishu:<guid>）
+      // 只接受 done 字段；标题/截止日等仍以飞书为准，不在本应用内修改
+      if (method === 'PUT' && segments.length === 3 && id === 'feishu') {
+        const guid = String(segments[2] || '').replace(/^feishu:/, '');
+        return readBody(req).then((body) => {
+          if (body.done === undefined) return sendJson(res, 400, { error: '缺少 done 字段' });
+          return feishuSetTaskDone(guid, !!body.done)
+            .then(() => sendJson(res, 200, { ok: true, done: !!body.done }))
+            .catch((e) => {
+              let msg = e.message;
+              if (/99991679|permission_violations|Unauthorized/i.test(msg)) {
+                msg += '；请在飞书设置中重新授权以授予 task:task:write（更新任务）权限';
+              }
+              return sendJson(res, 400, { error: msg });
+            });
+        }).catch((e) => sendJson(res, 400, { error: e.message }));
+      }
 
       // DELETE /api/todos/feishu/:id — 删除飞书任务（id 形如 feishu:<guid>）
       if (method === 'DELETE' && segments.length === 3 && id === 'feishu') {

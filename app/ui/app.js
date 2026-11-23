@@ -42,12 +42,16 @@ const state = {
   dragEv: null,             // 正在拖拽改期的日程
   dragGrabMin: 0,           // 按住点相对事件块顶部的分钟偏移（还原抓取位置）
   todos: [],                // 右侧待办任务（本地）
-  feishuTodos: [],          // 飞书任务（与日历共用授权 token，只读）
+  feishuTodos: [],          // 飞书任务（与日历共用授权 token）
   feishuTodoError: '',
   todoFilter: 'active',     // active | done | all
+  todoSource: 'all',        // all | local | feishu —— 来源筛选
+  todoPage: 1,              // 当前页（每页 20 条）
   todoEditId: null,         // 正在进行行内编辑的待办 id
   todoNoticeTimer: null,
 };
+
+const TODO_PAGE_SIZE = 20;
 
 /* ---------------- API 助手 ---------------- */
 
@@ -423,6 +427,8 @@ function visibleTodos() {
   // 本地待办与飞书任务同列展示：未完成优先 → 截止日期近的优先，同日本地在前
   const all = state.todos.concat(state.feishuTodos || []);
   return all.filter((t) => {
+    const src = t.source === 'feishu' ? 'feishu' : 'local';
+    if (state.todoSource !== 'all' && src !== state.todoSource) return false;
     if (state.todoFilter === 'active') return !t.done;
     if (state.todoFilter === 'done') return !!t.done;
     return true;
@@ -444,6 +450,9 @@ function renderTodoPanel() {
   document.querySelectorAll('#todoFilters button').forEach((b) => {
     b.classList.toggle('active', b.dataset.filter === state.todoFilter);
   });
+  document.querySelectorAll('#todoSourceFilters button').forEach((b) => {
+    b.classList.toggle('active', b.dataset.source === state.todoSource);
+  });
   const sourceNote = document.getElementById('todoSourceNote');
   if (sourceNote) {
     if (state.feishuTodoError) {
@@ -453,19 +462,36 @@ function renderTodoPanel() {
     } else if (state.feishuTodos.length) {
       sourceNote.hidden = false;
       sourceNote.classList.remove('err');
-      sourceNote.textContent = '已接入飞书任务 ' + state.feishuTodos.length + ' 项（未完成的可转日程）';
+      const cap = state.feishuTodos.length >= 100 ? '，已达单次上限 100 条' : '';
+      sourceNote.textContent = '已接入飞书任务 ' + state.feishuTodos.length + ' 项' + cap + '（可勾选完成，未完成的可转日程）';
     } else {
       sourceNote.hidden = true;
     }
   }
   clear(listEl);
   const todos = visibleTodos();
+  // 分页：每页 20 条；筛选变化或删除后页码自动收敛到有效范围
+  const totalPages = Math.max(1, Math.ceil(todos.length / TODO_PAGE_SIZE));
+  if (state.todoPage > totalPages) state.todoPage = totalPages;
+  if (state.todoPage < 1) state.todoPage = 1;
+  const pageStart = (state.todoPage - 1) * TODO_PAGE_SIZE;
+  const pageTodos = todos.slice(pageStart, pageStart + TODO_PAGE_SIZE);
+  const pager = document.getElementById('todoPager');
+  if (pager) {
+    pager.hidden = totalPages <= 1;
+    const info = document.getElementById('todoPageInfo');
+    if (info) info.textContent = state.todoPage + ' / ' + totalPages;
+    const prev = document.getElementById('btnTodoPrev');
+    const next = document.getElementById('btnTodoNext');
+    if (prev) prev.disabled = state.todoPage <= 1;
+    if (next) next.disabled = state.todoPage >= totalPages;
+  }
   if (!todos.length) {
     listEl.appendChild(el('div', 'todo-empty', '暂无待办，添加一个吧'));
     return;
   }
   const todayStr = fmtDate(new Date());
-  todos.forEach((t) => {
+  pageTodos.forEach((t) => {
     if (state.todoEditId === t.id) {
       listEl.appendChild(buildTodoEditRow(t));
       return;
@@ -478,8 +504,8 @@ function renderTodoPanel() {
     cb.className = 'todo-check';
     cb.checked = !!t.done;
     if (isRemote) {
-      cb.disabled = true;
-      cb.title = '飞书任务为只读，请在飞书中勾选完成';
+      cb.title = t.done ? '在飞书中标记为未完成' : '在飞书中标记为已完成';
+      cb.addEventListener('change', () => feishuTodoSetDone(t.id, cb.checked));
     } else {
       cb.title = t.done ? '标记为未完成' : '标记为已完成';
       cb.addEventListener('change', () => todoSetDone(t.id, cb.checked));
@@ -588,6 +614,7 @@ async function todoAdd(toFeishu) {
       await apiSend('POST', '/api/todos/feishu', { title, due: dueEl.value || '' });
       input.value = ''; dueEl.value = '';
       state.todoFilter = 'active';
+      state.todoPage = 1;
       await loadFeishuTodos(true);
       render();
       input.focus();
@@ -596,6 +623,7 @@ async function todoAdd(toFeishu) {
       await apiSend('POST', '/api/todos', { title, due: dueEl.value || '' });
       input.value = ''; dueEl.value = '';
       state.todoFilter = 'active';
+      state.todoPage = 1;
       state.todoEditId = null;
       await loadTodos();
       render();
@@ -614,6 +642,19 @@ async function feishuTodoDelete(t) {
     render();
     showTodoNotice('飞书任务「' + t.title + '」已删除');
   } catch (ex) { alert('删除飞书任务失败：' + ex.message); }
+}
+
+/** 勾选/取消勾选飞书任务：写回飞书 completed_at，成功后强制刷新列表保持与服务端一致 */
+async function feishuTodoSetDone(id, done) {
+  try {
+    await apiSend('PUT', '/api/todos/feishu/' + encodeURIComponent(id), { done });
+    await loadFeishuTodos(true);
+    render();
+    showTodoNotice(done ? '飞书任务已标记完成' : '飞书任务已恢复未完成');
+  } catch (ex) {
+    alert('更新飞书任务失败：' + ex.message);
+    render(); // 失败时用 state 里的真实状态回滚勾选框
+  }
 }
 
 async function todoSetDone(id, done) {
@@ -2023,9 +2064,25 @@ function bindEvents() {
   document.querySelectorAll('#todoFilters button').forEach((b) => {
     b.addEventListener('click', () => {
       state.todoFilter = b.dataset.filter;
+      state.todoPage = 1;
       state.todoEditId = null;
       render();
     });
+  });
+  document.querySelectorAll('#todoSourceFilters button').forEach((b) => {
+    b.addEventListener('click', () => {
+      state.todoSource = b.dataset.source;
+      state.todoPage = 1;
+      state.todoEditId = null;
+      render();
+    });
+  });
+  document.getElementById('btnTodoPrev').addEventListener('click', () => {
+    if (state.todoPage > 1) { state.todoPage -= 1; render(); }
+  });
+  document.getElementById('btnTodoNext').addEventListener('click', () => {
+    state.todoPage += 1;
+    render();
   });
 
   // 添加日历源（CalDAV / ICS / 飞书）——必须箭头包装，避免把 MouseEvent 当成 cal（否则误入编辑模式）

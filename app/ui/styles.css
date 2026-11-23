@@ -1233,6 +1233,37 @@ body {
   font-weight: 500;
 }
 
+/* 来源筛选（全部 / 本地 / 飞书）：与状态筛选同款，做二级、视觉更轻 */
+.todo-source-filters { padding-top: 0; border-bottom: 1px solid var(--border); }
+.todo-source-filters button { height: 22px; font-size: 11.5px; }
+.todo-source-filters button.active { background: rgba(255,255,255,.92); font-weight: 500; }
+
+/* 分页（每页 20 条） */
+.todo-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.todo-page-btn {
+  width: 22px; height: 22px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: #fff;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+.todo-page-btn:hover:not(:disabled) { border-color: var(--border-strong); }
+.todo-page-btn:disabled { opacity: .4; cursor: default; background: transparent; }
+.todo-page-info { min-width: 46px; text-align: center; }
+
 .todo-notice {
   margin: 8px 10px 0;
   padding: 6px 8px;

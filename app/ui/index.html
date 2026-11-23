@@ -90,9 +90,19 @@
           <button data-filter="done">已完成</button>
           <button data-filter="all">全部</button>
         </div>
+        <div class="todo-filters todo-source-filters" id="todoSourceFilters">
+          <button data-source="all" class="active" title="显示全部来源">全部来源</button>
+          <button data-source="local" title="只看本地待办">本地</button>
+          <button data-source="feishu" title="只看飞书任务">飞书</button>
+        </div>
         <div class="todo-source-note" id="todoSourceNote" hidden></div>
         <div class="todo-notice" id="todoNotice" hidden></div>
         <div class="todo-list" id="todoList"></div>
+        <div class="todo-pager" id="todoPager" hidden>
+          <button class="todo-page-btn" id="btnTodoPrev" title="上一页">‹</button>
+          <span class="todo-page-info" id="todoPageInfo"></span>
+          <button class="todo-page-btn" id="btnTodoNext" title="下一页">›</button>
+        </div>
       </aside>
     </div>
   </div>
