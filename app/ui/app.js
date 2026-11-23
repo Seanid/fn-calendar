@@ -147,6 +147,31 @@ function el(tag, cls, text) {
 
 function clear(node) { node.textContent = ''; }
 
+/** 内联 SVG 图标：stroke 跟随 currentColor，替代 → / ✎ / × 等字符，避免字体造成的粗细不一 */
+function icon(paths, size) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const s = document.createElementNS(NS, 'svg');
+  s.setAttribute('viewBox', '0 0 16 16');
+  s.setAttribute('width', size || 13);
+  s.setAttribute('height', size || 13);
+  s.setAttribute('fill', 'none');
+  s.setAttribute('stroke', 'currentColor');
+  s.setAttribute('stroke-width', '1.7');
+  s.setAttribute('stroke-linecap', 'round');
+  s.setAttribute('stroke-linejoin', 'round');
+  s.setAttribute('aria-hidden', 'true');
+  (Array.isArray(paths) ? paths : [paths]).forEach((d) => {
+    const p = document.createElementNS(NS, 'path');
+    p.setAttribute('d', d);
+    s.appendChild(p);
+  });
+  return s;
+}
+const ICON_ARROW = 'M2.6 8h10.2M9.4 4.4 13 8l-3.6 3.6';
+const ICON_PENCIL = ['M2.9 13.1l.7-2.9 7.4-7.4 2.2 2.2-7.4 7.4z', 'M9.9 3.9l2.2 2.2'];
+const ICON_CLOSE = 'M4.3 4.3 11.7 11.7M11.7 4.3 4.3 11.7';
+const ICON_CHECK = 'M3.6 8.4 6.5 11.3 12.4 5.2';
+
 /* ---------------- 数据加载 ---------------- */
 
 async function refreshAll() {
@@ -446,7 +471,11 @@ function renderTodoPanel() {
   const listEl = document.getElementById('todoList');
   if (!listEl) return;
   const active = state.todos.concat(state.feishuTodos || []).filter((t) => !t.done).length;
-  document.getElementById('todoCount').textContent = active ? '· ' + active : '';
+  const countEl = document.getElementById('todoCount');
+  if (countEl) {
+    countEl.textContent = active ? String(active) : '';
+    countEl.hidden = !active;
+  }
   document.querySelectorAll('#todoFilters button').forEach((b) => {
     b.classList.toggle('active', b.dataset.filter === state.todoFilter);
   });
@@ -487,10 +516,20 @@ function renderTodoPanel() {
     if (next) next.disabled = state.todoPage >= totalPages;
   }
   if (!todos.length) {
-    listEl.appendChild(el('div', 'todo-empty', '暂无待办，添加一个吧'));
+    const box = el('div', 'todo-empty');
+    const ico = el('div', 'todo-empty-ico');
+    ico.appendChild(icon(ICON_CHECK, 18));
+    box.appendChild(ico);
+    const filtered = state.todoFilter !== 'active' || state.todoSource !== 'all';
+    box.appendChild(el('div', 'todo-empty-title', filtered ? '没有符合条件的任务' : '暂无待办'));
+    box.appendChild(el('div', 'todo-empty-sub', filtered
+      ? '试试切换上方的筛选条件'
+      : '在上方输入框添加，或点「飞书」创建飞书任务'));
+    listEl.appendChild(box);
     return;
   }
   const todayStr = fmtDate(new Date());
+  const tomorrowStr = fmtDate(new Date(Date.now() + 86400000));
   pageTodos.forEach((t) => {
     if (state.todoEditId === t.id) {
       listEl.appendChild(buildTodoEditRow(t));
@@ -498,7 +537,7 @@ function renderTodoPanel() {
     }
     const isRemote = t.source === 'feishu';
     const item = el('div', 'todo-item' + (t.done ? ' done' : '') + (isRemote ? ' remote' : ''));
-    const main = el('div', 'todo-main');
+    const row = el('div', 'todo-row');
     const cb = el('input');
     cb.type = 'checkbox';
     cb.className = 'todo-check';
@@ -522,7 +561,16 @@ function renderTodoPanel() {
     const meta = el('div', 'todo-meta');
     if (isRemote) meta.appendChild(el('span', 'todo-src-badge', '飞书'));
     if (t.due) {
-      const due = el('span', 'todo-due' + (!t.done && t.due < todayStr ? ' overdue' : ''), '截止 ' + t.due.slice(5));
+      const overdue = !t.done && t.due < todayStr;
+      const days = Math.round((new Date(todayStr + 'T00:00:00') - new Date(t.due + 'T00:00:00')) / 86400000);
+      const label = t.due === todayStr ? '今天'
+        : t.due === tomorrowStr ? '明天'
+        : overdue ? '逾期 ' + days + ' 天'
+        : t.due.slice(5);
+      const cls = 'todo-due'
+        + (overdue ? ' overdue' : '')
+        + (!t.done && t.due === todayStr ? ' today' : '');
+      const due = el('span', cls, label);
       due.title = '截止日期：' + t.due;
       meta.appendChild(due);
     }
@@ -532,37 +580,41 @@ function renderTodoPanel() {
       meta.appendChild(conv);
     }
     if (meta.childElementCount) body.appendChild(meta);
-    main.append(cb, body);
-    item.appendChild(main);
 
     const actions = el('div', 'todo-actions');
     if (isRemote) {
       if (!t.done) {
-        const convBtn = el('button', 'todo-btn todo-btn-convert', '→');
+        const convBtn = el('button', 'todo-btn todo-btn-convert');
+        convBtn.appendChild(icon(ICON_ARROW, 14));
         convBtn.title = '转为日程并删除飞书任务';
         convBtn.addEventListener('click', () => todoConvert(t.id, true));
         actions.appendChild(convBtn);
       }
-      const delBtn = el('button', 'todo-btn todo-btn-del', '×');
+      const delBtn = el('button', 'todo-btn todo-btn-del');
+      delBtn.appendChild(icon(ICON_CLOSE, 13));
       delBtn.title = '删除飞书任务（同时删除飞书中的原任务）';
       delBtn.addEventListener('click', () => feishuTodoDelete(t));
       actions.appendChild(delBtn);
     } else {
       if (!t.done) {
-        const convBtn = el('button', 'todo-btn todo-btn-convert', '→');
+        const convBtn = el('button', 'todo-btn todo-btn-convert');
+        convBtn.appendChild(icon(ICON_ARROW, 14));
         convBtn.title = '转为日程';
         convBtn.addEventListener('click', () => todoConvert(t.id));
         actions.appendChild(convBtn);
       }
-      const editBtn = el('button', 'todo-btn', '✎');
+      const editBtn = el('button', 'todo-btn');
+      editBtn.appendChild(icon(ICON_PENCIL, 13));
       editBtn.title = '编辑待办';
       editBtn.addEventListener('click', () => todoStartEdit(t.id));
-      const delBtn = el('button', 'todo-btn todo-btn-del', '×');
+      const delBtn = el('button', 'todo-btn todo-btn-del');
+      delBtn.appendChild(icon(ICON_CLOSE, 13));
       delBtn.title = '删除待办';
       delBtn.addEventListener('click', () => todoDelete(t));
       actions.append(editBtn, delBtn);
     }
-    item.appendChild(actions);
+    row.append(cb, body, actions);
+    item.appendChild(row);
     listEl.appendChild(item);
   });
 }
