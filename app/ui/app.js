@@ -516,9 +516,11 @@ function renderTodoPanel() {
         convBtn.title = '转为日程并删除飞书任务';
         convBtn.addEventListener('click', () => todoConvert(t.id, true));
         actions.appendChild(convBtn);
-      } else {
-        actions.appendChild(el('span', 'todo-remote-hint', '已完成'));
       }
+      const delBtn = el('button', 'todo-btn todo-btn-del', '×');
+      delBtn.title = '删除飞书任务（同时删除飞书中的原任务）';
+      delBtn.addEventListener('click', () => feishuTodoDelete(t));
+      actions.appendChild(delBtn);
     } else {
       if (!t.done) {
         const convBtn = el('button', 'todo-btn todo-btn-convert', '→');
@@ -573,24 +575,45 @@ function buildTodoEditRow(t) {
   return item;
 }
 
-async function todoAdd() {
+async function todoAdd(toFeishu) {
   const input = document.getElementById('todoInput');
   const dueEl = document.getElementById('todoDue');
   const err = document.getElementById('todoError');
   const title = input.value.trim();
   if (!title) { err.textContent = '请输入待办标题'; input.focus(); return; }
-  const btn = document.getElementById('btnTodoAdd');
+  const btn = document.getElementById(toFeishu ? 'btnTodoAddFeishu' : 'btnTodoAdd');
   btn.disabled = true; err.textContent = '';
   try {
-    await apiSend('POST', '/api/todos', { title, due: dueEl.value || '' });
-    input.value = ''; dueEl.value = '';
-    state.todoFilter = 'active';
-    state.todoEditId = null;
-    await loadTodos();
-    render();
-    input.focus();
+    if (toFeishu) {
+      await apiSend('POST', '/api/todos/feishu', { title, due: dueEl.value || '' });
+      input.value = ''; dueEl.value = '';
+      state.todoFilter = 'active';
+      await loadFeishuTodos(true);
+      render();
+      input.focus();
+      showTodoNotice('已创建飞书任务「' + title + '」');
+    } else {
+      await apiSend('POST', '/api/todos', { title, due: dueEl.value || '' });
+      input.value = ''; dueEl.value = '';
+      state.todoFilter = 'active';
+      state.todoEditId = null;
+      await loadTodos();
+      render();
+      input.focus();
+    }
   } catch (ex) { err.textContent = ex.message; }
   btn.disabled = false;
+}
+
+/** 删除飞书任务：同步删除飞书侧原任务，成功后强制刷新列表 */
+async function feishuTodoDelete(t) {
+  if (!confirm('删除飞书任务「' + t.title + '」？会同时删除飞书中的原任务。')) return;
+  try {
+    await apiSend('DELETE', '/api/todos/feishu/' + encodeURIComponent(t.id));
+    await loadFeishuTodos(true);
+    render();
+    showTodoNotice('飞书任务「' + t.title + '」已删除');
+  } catch (ex) { alert('删除飞书任务失败：' + ex.message); }
 }
 
 async function todoSetDone(id, done) {
@@ -1908,9 +1931,10 @@ function bindEvents() {
   document.getElementById('btnTodoToggle').addEventListener('click', toggleTodoPanel);
   document.getElementById('btnTodoCollapse').addEventListener('click', () => applyTodoVisibility(false, true));
   document.getElementById('btnFeishuTaskRefresh').addEventListener('click', refreshFeishuTodos);
-  document.getElementById('btnTodoAdd').addEventListener('click', todoAdd);
+  document.getElementById('btnTodoAdd').addEventListener('click', () => todoAdd(false));
+  document.getElementById('btnTodoAddFeishu').addEventListener('click', () => todoAdd(true));
   document.getElementById('todoInput').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') todoAdd();
+    if (e.key === 'Enter') todoAdd(false);
   });
   document.querySelectorAll('#todoFilters button').forEach((b) => {
     b.addEventListener('click', () => {
