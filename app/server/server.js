@@ -384,6 +384,10 @@ async function feishuCreateTask(title, due) {
     const d = new Date(String(due) + 'T00:00:00');
     if (!isNaN(d.getTime())) body.due = { timestamp: String(d.getTime()), is_all_day: true };
   }
+  // 必须显式把本人加为负责人：飞书任务列表（type=my_tasks）只返回「与我相关」的任务，
+  // 不设 members 时任务没有任何成员，建完刷新就看不到（用户反馈的「新增后不显示」根因）。
+  const openId = await feishuCurrentOpenId();
+  body.members = [{ id: openId, type: 'user', role: 'assignee' }];
   const data = await feishuReq('/open-apis/task/v2/tasks', { method: 'POST', auth: 'user', body });
   _feishuTasksCache = { key: '', at: 0, tasks: [] };
   return data.task || null;
@@ -728,6 +732,22 @@ async function feishuDeleteEvent(cal, internalId) {
 async function feishuUserInfo() {
   const data = await feishuReq('/open-apis/authen/v1/user_info', { auth: 'user' });
   return { openId: data.open_id || '', name: data.name || data.en_name || '' };
+}
+
+/**
+ * 当前授权用户的 open_id。
+ * 创建飞书任务时必须把本人放进 members 并设 role=assignee，否则任务没有任何成员，
+ * 用 type=my_tasks 拉列表时看不到自己刚建的任务（表现为「新增后不显示」）。
+ */
+async function feishuCurrentOpenId() {
+  const cfg = loadFeishu();
+  if (cfg.userOpenId) return cfg.userOpenId;
+  const info = await feishuUserInfo();
+  if (!info.openId) throw new Error('无法获取飞书用户 open_id，请在飞书设置中重新授权');
+  cfg.userOpenId = info.openId;
+  if (info.name && !cfg.userName) cfg.userName = info.name;
+  saveFeishu(cfg);
+  return info.openId;
 }
 
 /** 计算远程源同步窗口（与 CalDAV/ICS 一致：过去 2 年 ~ 未来 3 年） */
@@ -2082,6 +2102,7 @@ function handleApi(method, segments, req, res) {
         let warning = '';
         try {
           const info = await feishuUserInfo();
+          cfg.userOpenId = info.openId || cfg.userOpenId || '';
           cfg.userName = info.name || info.en_name || cfg.userName || '';
         } catch (e) {
           warning = 'Token 已保存，但校验失败：' + e.message;
@@ -2104,6 +2125,7 @@ function handleApi(method, segments, req, res) {
       cfg.refreshToken = '';
       cfg.tokenExpiresAt = 0;
       cfg.userName = '';
+      cfg.userOpenId = '';
       cfg.calendars = [];
       saveFeishu(cfg);
       _feishuTasksCache = { key: '', at: 0, tasks: [] };
