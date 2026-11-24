@@ -24,6 +24,11 @@ const COLORS = {
 const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_H = 56; // 每小时的像素高度，与 CSS --hour-h 保持一致
 
+/* 小屏（手机）断点：与 styles.css 中 body.is-mobile 的样式对应。
+   命中后整套界面切换为手机布局（底部标签栏 / 抽屉侧栏 / 整页待办 / 整页弹窗）。 */
+const MOBILE_MQ = '(max-width: 760px)';
+const mobileQuery = window.matchMedia(MOBILE_MQ);
+
 /* ---------------- 状态 ---------------- */
 
 const state = {
@@ -49,6 +54,8 @@ const state = {
   todoPage: 1,              // 当前页（每页 20 条）
   todoEditId: null,         // 正在进行行内编辑的待办 id
   todoNoticeTimer: null,
+  mobile: false,            // 当前是否为手机界面（窄屏）
+  tlScroll: {},             // 移动端时间轴的滚动位置（切换/重绘后保持）
 };
 
 const TODO_PAGE_SIZE = 20;
@@ -196,7 +203,8 @@ function viewRange() {
   if (state.view === 'year') {
     return { start: new Date(state.year, 0, 1), end: new Date(state.year, 11, 31) };
   }
-  if (state.view === 'week') {
+  if (state.view === 'week' || state.view === 'day') {
+    // 日视图只渲染一天，但也加载整周：表头农历、迷你月历圆点、切回周视图都不必再请求
     const s = startOfWeek(state.selected);
     return { start: s, end: addDays(s, 6) };
   }
@@ -211,10 +219,9 @@ async function loadMonth() {
 }
 
 async function loadWeekRangeEvents() {
-  // 周/日视图：加载覆盖当前视口的区间
+  // 周/日视图：统一加载整周（此前日视图按「周首日~周首日」取数，导致非周日的日视图里看不到任何日程）
   const start = startOfWeek(state.selected);
-  let end = addDays(start, state.view === 'day' ? 1 : 7);
-  end = addDays(end, -1);
+  const end = addDays(start, 6);
   state.events = await apiGet('/api/events', { start: fmtDate(start), end: fmtDate(end) });
   // 同时取该周的农历信息（用于表头显示）
   state.monthData = null;
@@ -265,11 +272,20 @@ function backgroundSync() {
   }).then(() => render()).catch(() => {});
 }
 
-/** 本地 + 可见远程事件的合并列表 */
+/** 本地 + 可见远程事件的合并列表（按 id 去重） */
 function visibleEvents() {
-  return state.events.concat(
+  const list = state.events.concat(
     state.remoteEvents.filter((ev) => !state.hiddenCals.has(ev.calendarId))
   );
+  // 月视图接口会把跨天日程放进它覆盖的每一天的 cell 里，扁平化后会重复出现；
+  // 不在这里去重的话，单日内会被渲染成多个重复条目（重复日程实例的 id 唯一，不受影响）。
+  const seen = new Set();
+  return list.filter((ev) => {
+    const key = (ev.remote ? 'r:' : 'l:') + ev.id;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function evColor(ev) {
@@ -291,12 +307,18 @@ function render() {
   renderToolbar();
   renderSidebar();
   renderTodoPanel();
+  syncMobileShell();
   const area = document.getElementById('mainArea');
   clear(area);
-  if (state.view === 'month') renderMonthView(area);
-  else if (state.view === 'week') renderWeekView(area);
-  else if (state.view === 'day') renderDayView(area);
-  else renderYearView(area);
+  if (state.view === 'month') {
+    if (state.mobile) renderMobileMonthView(area); else renderMonthView(area);
+  } else if (state.view === 'week' || state.view === 'day') {
+    if (state.mobile) renderMobileTimeline(area);
+    else if (state.view === 'week') renderWeekView(area);
+    else renderDayView(area);
+  } else {
+    renderYearView(area);
+  }
 }
 
 function renderToolbar() {
@@ -306,7 +328,9 @@ function renderToolbar() {
   else if (state.view === 'week') {
     const s = startOfWeek(state.selected);
     const e = addDays(s, 6);
-    title = s.getFullYear() + '年' + (s.getMonth() + 1) + '月' + s.getDate() + '日 — ' + e.getMonth() + '月' + e.getDate() + '日';
+    title = state.mobile
+      ? (s.getMonth() + 1) + '月' + s.getDate() + '日 – ' + (e.getMonth() + 1) + '月' + e.getDate() + '日'
+      : s.getFullYear() + '年' + (s.getMonth() + 1) + '月' + s.getDate() + '日 — ' + e.getMonth() + '月' + e.getDate() + '日';
   } else {
     title = state.year + '年' + state.month + '月' + state.selected.getDate() + '日';
   }
@@ -441,6 +465,11 @@ function applyTodoVisibility(show, remember) {
   const btn = document.getElementById('btnTodoToggle');
   if (btn) btn.classList.toggle('btn-primary', !show); // 收起时高亮按钮，提示可点开
   if (remember) localStorage.setItem('fnCalTodoVisible', show ? '1' : '0');
+  if (state.mobile) {
+    closeDrawer();
+    if (show) state.todoPage = state.todoPage || 1;
+  }
+  syncMobileShell();
 }
 
 function toggleTodoPanel() {
@@ -475,6 +504,12 @@ function renderTodoPanel() {
   if (countEl) {
     countEl.textContent = active ? String(active) : '';
     countEl.hidden = !active;
+  }
+  // 移动端底部标签栏上的未完成数量角标
+  const mBadge = document.getElementById('mTodoBadge');
+  if (mBadge) {
+    mBadge.textContent = active ? String(active) : '';
+    mBadge.hidden = !active;
   }
   document.querySelectorAll('#todoFilters button').forEach((b) => {
     b.classList.toggle('active', b.dataset.filter === state.todoFilter);
@@ -1341,6 +1376,7 @@ function selectDate(d) {
     state.year = state.selected.getFullYear();
     state.month = state.selected.getMonth() + 1;
   }
+  if (state.mobile) closeDrawer(); // 抽屉里点了日期后自动收起，回到日历
   refreshAll();
 }
 
@@ -2080,6 +2116,360 @@ async function saveCalModal() {
   btn.disabled = false;
 }
 
+/* ============================================================
+   移动端界面
+   —— 窄屏（<=760px）时自动切换：顶栏两行 + 底部标签栏 + 抽屉侧栏
+      + 月视图紧凑网格（选中日议程在下方）+ 可横滑的周/日时间轴。
+      功能与桌面版完全一致：查看/新建/编辑/删除日程、导入日历源、
+      待办（含飞书任务）增删改、转日程、筛选与分页。
+   ============================================================ */
+
+/** 切换手机 / 桌面界面（view 变化时重绘；不改动数据） */
+function applyViewportMode(on) {
+  const next = !!on;
+  if (state.mobile === next) { syncMobileShell(); return; }
+  state.mobile = next;
+  document.body.classList.toggle('is-mobile', next);
+  if (!next) {
+    closeDrawer();
+  } else {
+    // 手机界面默认先看日历，待办用底部标签栏打开
+    closeDrawer();
+    const panel = document.getElementById('todoPanel');
+    if (panel && !panel.hidden) {
+      panel.hidden = true;
+      const btn = document.getElementById('btnTodoToggle');
+      if (btn) btn.classList.add('btn-primary');
+    }
+  }
+  syncMobileShell();
+  render();
+}
+
+/** 同步移动端外壳状态（底部标签栏高亮 / 悬浮按钮显隐） */
+function syncMobileShell() {
+  const panel = document.getElementById('todoPanel');
+  const todoOpen = state.mobile && !!panel && !panel.hidden;
+  document.body.classList.toggle('todo-open', todoOpen);
+  const drawerOpen = document.body.classList.contains('drawer-open');
+  document.querySelectorAll('#mTabbar .m-tab').forEach((b) => {
+    const tab = b.dataset.tab;
+    const active = tab === 'todos' ? todoOpen : (tab === 'lists' ? drawerOpen : !todoOpen && !drawerOpen);
+    b.classList.toggle('active', active);
+  });
+}
+
+function openDrawer() {
+  if (!state.mobile) return;
+  const panel = document.getElementById('todoPanel');
+  if (panel && !panel.hidden) panel.hidden = true; // 抽屉优先于待办整页
+  document.body.classList.add('drawer-open');
+  const bd = document.getElementById('mBackdrop');
+  if (bd) bd.hidden = false;
+  syncMobileShell();
+}
+
+function closeDrawer() {
+  document.body.classList.remove('drawer-open');
+  const bd = document.getElementById('mBackdrop');
+  if (bd) bd.hidden = true;
+  syncMobileShell();
+}
+
+/** 移动端月视图点选某天：同月只换选中（不重新请求），跨月才切换月份 */
+function mobilePickDay(d) {
+  const inMonth = d.getFullYear() === state.year && d.getMonth() + 1 === state.month;
+  if (inMonth) {
+    state.selected = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    render();
+  } else {
+    selectDate(d);
+  }
+}
+
+/** 某天的农历描述（月视图紧凑格里只显示节气/节日，议程标题里显示完整农历） */
+function lunarInfoOf(d) {
+  const cells = (state.monthData && state.monthData.cells) || [];
+  const c = cells.find((x) => x.year === d.getFullYear() && x.month === d.getMonth() + 1 && x.day === d.getDate());
+  if (c && c.lunar) {
+    let s = '农历' + c.lunar.monthCn + '月' + c.lunar.dayCn;
+    if (c.lunar.jieQi) s += ' · ' + c.lunar.jieQi;
+    if (c.lunar.festivals && c.lunar.festivals.length) s += ' · ' + c.lunar.festivals[0];
+    return s;
+  }
+  const li = state.lunarMap && state.lunarMap[fmtDate(d)];
+  if (li && li.lunar) return '农历' + li.lunar.monthCn + '月' + li.lunar.dayCn + (li.lunar.jieQi ? ' · ' + li.lunar.jieQi : '');
+  return '';
+}
+
+/* ---------------- 月视图（紧凑网格 + 当日议程） ---------------- */
+
+function renderMobileMonthView(area) {
+  if (!state.monthData) {
+    area.appendChild(el('div', 'empty-hint', '加载中…'));
+    return;
+  }
+  const view = el('div', 'm-month');
+
+  const head = el('div', 'm-week-head');
+  WEEKDAY_CN.forEach((w, i) => head.appendChild(el('span', i === 0 || i === 6 ? 'we' : '', w)));
+  view.appendChild(head);
+
+  const grid = el('div', 'm-grid');
+  const cells = state.monthData.cells;
+  grid.style.gridTemplateRows = 'repeat(' + Math.ceil(cells.length / 7) + ', minmax(40px, 1fr))';
+  cells.forEach((c) => grid.appendChild(buildMobileCell(c)));
+  view.appendChild(grid);
+
+  view.appendChild(buildMobileAgenda());
+  area.appendChild(view);
+}
+
+function buildMobileCell(c) {
+  const d = new Date(c.year, c.month - 1, c.day);
+  const cell = el('div', 'm-cell');
+  if (!c.inMonth) cell.classList.add('out');
+  if (c.isToday) cell.classList.add('today');
+  if (isSameDay(d, state.selected)) cell.classList.add('sel');
+  cell.appendChild(el('span', 'm-num', String(c.day)));
+
+  const L = c.lunar || {};
+  let sub = '';
+  let subCls = 'm-sub';
+  if (L.jieQi) { sub = L.jieQi; subCls += ' jieqi'; }
+  else if (L.festivals && L.festivals.length) { sub = L.festivals[0]; subCls += ' fest'; }
+  else if (L.monthCn === '正' && L.dayCn === '初一') { sub = '春节'; subCls += ' fest'; }
+  if (sub) cell.appendChild(el('span', subCls, sub));
+
+  const evs = eventsOfDay(d);
+  if (evs.length) {
+    const dots = el('span', 'm-dots');
+    const cols = [];
+    evs.forEach((ev) => { const col = evColor(ev); if (cols.indexOf(col) < 0) cols.push(col); });
+    cols.slice(0, 3).forEach((col) => {
+      const dot = el('span', 'm-dot');
+      dot.style.background = col;
+      dots.appendChild(dot);
+    });
+    cell.appendChild(dots);
+  }
+  cell.title = evs.length ? evs.length + ' 个日程' : '';
+  cell.addEventListener('click', () => mobilePickDay(d));
+  return cell;
+}
+
+function buildMobileAgenda() {
+  const box = el('div', 'm-agenda');
+  // state.selected 可能带有当前时分，eventsOfDay 需要当天零点（否则当天的定时日程会被判为已结束）
+  const d = new Date(state.selected.getFullYear(), state.selected.getMonth(), state.selected.getDate());
+
+  const head = el('div', 'm-ag-head');
+  const left = el('div', 'm-ag-left');
+  left.appendChild(el('span', 'm-ag-date', (d.getMonth() + 1) + '月' + d.getDate() + '日'));
+  left.appendChild(el('span', 'm-ag-wd', WEEKDAY_FULL[d.getDay()] + (isSameDay(d, state.today) ? ' · 今天' : '')));
+  const lunar = lunarInfoOf(d);
+  if (lunar) left.appendChild(el('span', 'm-ag-lunar', lunar));
+  head.appendChild(left);
+
+  const addBtn = el('button', 'm-ag-add');
+  addBtn.type = 'button';
+  addBtn.title = '在这一天新建日程';
+  addBtn.appendChild(icon('M8 3.4v9.2M3.4 8h9.2', 15));
+  addBtn.addEventListener('click', () => openEditor('create', d));
+  head.appendChild(addBtn);
+  box.appendChild(head);
+
+  const evs = eventsOfDay(d).slice().sort((a, b) => {
+    if (!!a.allDay !== !!b.allDay) return a.allDay ? -1 : 1;
+    const as = a.allDay ? '' : String(a.start);
+    const bs = b.allDay ? '' : String(b.start);
+    if (as !== bs) return as < bs ? -1 : 1;
+    return String(a.title || '').localeCompare(String(b.title || ''));
+  });
+
+  const list = el('div', 'm-ag-list');
+  if (!evs.length) {
+    const empty = el('div', 'm-ag-empty');
+    empty.appendChild(el('div', 't', '这天没有日程'));
+    empty.appendChild(el('div', 's', '点右上角 ＋ 或右下角按钮新建'));
+    list.appendChild(empty);
+  } else {
+    evs.forEach((ev) => list.appendChild(buildAgendaRow(ev)));
+  }
+  box.appendChild(list);
+  return box;
+}
+
+function buildAgendaRow(ev) {
+  const row = el('div', 'm-ag-ev');
+  const bar = el('span', 'm-ag-bar');
+  bar.style.background = evColor(ev);
+  row.appendChild(bar);
+
+  const main = el('div', 'm-ag-main');
+  main.appendChild(el('div', 'm-ag-title', ev.title));
+  const meta = el('div', 'm-ag-meta');
+  meta.appendChild(el('span', '', ev.allDay ? '全天' : (fmtTime(ev.start) + ' – ' + fmtTime(ev.end))));
+  if (ev.remote) {
+    let calName = ev.calendarName || '订阅日历';
+    if (isRecurringInstance(ev)) calName += ' · 重复';
+    meta.appendChild(el('span', 'm-ag-cal', calName));
+  }
+  main.appendChild(meta);
+  row.appendChild(main);
+
+  row.addEventListener('click', () => openEvent(ev));
+  return row;
+}
+
+/* ---------------- 周 / 日视图（可横滑时间轴） ---------------- */
+
+const M_TL_COLW = 88;  // 移动端每周列的宽度（周视图横向滚动）
+const M_TL_GUT = 42;   // 左侧时间刻度宽
+
+function renderMobileTimeline(area) {
+  const isWeek = state.view === 'week';
+  const start = isWeek
+    ? startOfWeek(state.selected)
+    : new Date(state.selected.getFullYear(), state.selected.getMonth(), state.selected.getDate());
+  const days = [];
+  for (let i = 0; i < (isWeek ? 7 : 1); i++) days.push(addDays(start, i));
+
+  const view = el('div', 'm-timeline');
+  const scroller = el('div', 'm-tl-scroll');
+  const inner = el('div', 'm-tl-inner');
+  if (isWeek) inner.style.width = (M_TL_GUT + days.length * M_TL_COLW) + 'px';
+
+  /* 表头：星期 + 日期 + 农历 */
+  const head = el('div', 'm-tl-head');
+  const corner = el('div', 'm-tl-corner');
+  corner.style.width = M_TL_GUT + 'px';
+  head.appendChild(corner);
+  days.forEach((d) => {
+    const col = el('div', 'm-tl-dh');
+    if (isWeek) col.style.flex = '0 0 ' + M_TL_COLW + 'px';
+    if (d.getDay() === 0 || d.getDay() === 6) col.classList.add('we');
+    if (isSameDay(d, state.today)) col.classList.add('today');
+    if (isSameDay(d, state.selected)) col.classList.add('sel');
+    col.appendChild(el('div', 'wd', WEEKDAY_CN[d.getDay()]));
+    col.appendChild(el('div', 'dd', String(d.getDate())));
+    const li = state.lunarMap && state.lunarMap[fmtDate(d)];
+    if (li) col.appendChild(el('div', 'lu', li.lunar.jieQi || (li.lunar.monthCn + '月' + li.lunar.dayCn)));
+    if (isWeek) {
+      col.title = '查看 ' + (d.getMonth() + 1) + '月' + d.getDate() + '日 的日视图';
+      col.addEventListener('click', () => {
+        state.selected = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+        state.view = 'day';
+        refreshAll();
+      });
+    }
+    head.appendChild(col);
+  });
+  inner.appendChild(head);
+
+  /* 全天日程行 */
+  const adr = el('div', 'm-tl-adrow');
+  const adLabel = el('div', 'm-tl-adlabel', '全天');
+  adLabel.style.width = M_TL_GUT + 'px';
+  adr.appendChild(adLabel);
+  let adCount = 0;
+  days.forEach((d) => {
+    const col = el('div', 'm-tl-adcol');
+    if (isWeek) col.style.flex = '0 0 ' + M_TL_COLW + 'px';
+    eventsOfDay(d).filter((ev) => ev.allDay).forEach((ev) => { col.appendChild(buildEventPill(ev)); adCount += 1; });
+    if (col.childElementCount === 0) col.addEventListener('dblclick', () => openEditor('create', d));
+    bindDayCellDrop(col, d);
+    adr.appendChild(col);
+  });
+  if (!adCount) adr.style.display = 'none'; // 没有全天日程时不再占一行
+  inner.appendChild(adr);
+
+  /* 时间网格 */
+  const body = el('div', 'm-tl-body');
+  body.style.height = (24 * HOUR_H) + 'px';
+
+  const gutter = el('div', 'm-tl-gutter');
+  gutter.style.width = M_TL_GUT + 'px';
+  for (let h = 0; h < 24; h++) {
+    const label = el('div', 'time-label', h === 0 ? '0时' : pad2(h) + ':00');
+    label.style.top = (h * HOUR_H) + 'px';
+    gutter.appendChild(label);
+  }
+  body.appendChild(gutter);
+
+  const cols = el('div', 'm-tl-cols');
+  if (isWeek) {
+    cols.style.flex = '0 0 auto';
+    cols.style.width = (days.length * M_TL_COLW) + 'px';
+  }
+  days.forEach((d) => {
+    const col = el('div', 'm-tl-col');
+    if (isWeek) col.style.flex = '0 0 ' + M_TL_COLW + 'px';
+    if (d.getDay() === 0 || d.getDay() === 6) col.classList.add('weekend');
+    if (isSameDay(d, state.today)) col.classList.add('today-col');
+    eventsOfDay(d).filter((ev) => !ev.allDay).forEach((ev) => {
+      const block = buildEvBlock(ev, d);
+      if (block) col.appendChild(block);
+    });
+    // 双击空白处按纵向位置新建定时日程
+    col.addEventListener('dblclick', (e) => {
+      const rect = col.getBoundingClientRect();
+      let mins = Math.floor((e.clientY - rect.top) / HOUR_H * 60);
+      mins = Math.max(0, Math.min(23 * 60 + 30, Math.round(mins / 5) * 5));
+      openEditor('create', new Date(d.getFullYear(), d.getMonth(), d.getDate()), mins);
+    });
+    bindTimeColDrop(col, d);
+    cols.appendChild(col);
+  });
+  body.appendChild(cols);
+  inner.appendChild(body);
+
+  /* 当前时间线 */
+  const now = new Date();
+  if (days.some((dd) => isSameDay(dd, now))) {
+    const nl = el('div', 'm-now-line');
+    nl.style.top = ((now.getHours() * 60 + now.getMinutes()) / 60 * HOUR_H) + 'px';
+    cols.appendChild(nl);
+  }
+
+  scroller.appendChild(inner);
+  view.appendChild(scroller);
+  area.appendChild(view);
+
+  // 滚动位置：首次进来定位到 7:00（8:00 刻度线正好落在表头下方），之后重绘保持不变
+  const key = isWeek ? 'week' : 'day';
+  const saved = state.tlScroll[key];
+  requestAnimationFrame(() => {
+    scroller.scrollTop = saved ? saved.top : 7 * HOUR_H;
+    scroller.scrollLeft = saved ? saved.left : 0;
+  });
+  scroller.addEventListener('scroll', () => {
+    state.tlScroll[key] = { top: scroller.scrollTop, left: scroller.scrollLeft };
+  });
+  return view;
+}
+
+/** 全天日程的小胶囊（月/周共用） */
+function buildEventPill(ev) {
+  let cls = 'ev-pill' + (ev.remote ? ' remote' : '');
+  if (isRecurringInstance(ev)) cls += ' recur';
+  else if (isFeishuEvent(ev)) cls += ' writable-remote';
+  const pill = el('div', cls, ev.title);
+  pill.style.background = evColor(ev);
+  const tipRemote = ev.remote
+    ? isFeishuEvent(ev)
+      ? (isRecurringInstance(ev) ? '（' + ev.calendarName + '·重复系列，可编辑整体系列）' : '（' + ev.calendarName + '，可编辑/拖拽）')
+      : '（' + ev.calendarName + '，只读订阅）'
+    : '';
+  pill.title = ev.title + tipRemote;
+  pill.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openEvent(ev);
+  });
+  setupDragSource(pill, ev);
+  return pill;
+}
+
 /* ---------------- 初始化 ---------------- */
 
 function bindEvents() {
@@ -2137,6 +2527,32 @@ function bindEvents() {
     render();
   });
 
+  // ——— 移动端外壳：抽屉 / 底部标签栏 / 悬浮新建 ———
+  const mMenu = document.getElementById('btnMenu');
+  if (mMenu) mMenu.addEventListener('click', openDrawer);
+  const mBackdrop = document.getElementById('mBackdrop');
+  if (mBackdrop) mBackdrop.addEventListener('click', closeDrawer);
+  const mDrawerClose = document.getElementById('btnDrawerClose');
+  if (mDrawerClose) mDrawerClose.addEventListener('click', closeDrawer);
+  document.querySelectorAll('#mTabbar .m-tab').forEach((b) => {
+    b.addEventListener('click', () => {
+      const tab = b.dataset.tab;
+      if (tab === 'todos') {
+        closeDrawer();
+        applyTodoVisibility(true, false);
+      } else if (tab === 'lists') {
+        const panel = document.getElementById('todoPanel');
+        if (panel && !panel.hidden) panel.hidden = true;
+        openDrawer();
+      } else {
+        closeDrawer();
+        applyTodoVisibility(false, false);
+      }
+    });
+  });
+  const mFab = document.getElementById('mFab');
+  if (mFab) mFab.addEventListener('click', () => openEditor('create', state.selected));
+
   // 添加日历源（CalDAV / ICS / 飞书）——必须箭头包装，避免把 MouseEvent 当成 cal（否则误入编辑模式）
   document.getElementById('btnAddList').addEventListener('click', () => openCalModal());
   document.getElementById('btnCalModalClose').addEventListener('click', closeCalModal);
@@ -2187,13 +2603,23 @@ function bindEvents() {
   });
 
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeEditor();
+    if (e.key === 'Escape') { closeEditor(); closeDrawer(); }
   });
 }
 
 async function init() {
   bindEvents();
-  applyTodoVisibility(localStorage.getItem('fnCalTodoVisible') !== '0', false);
+  // 选中日统一为当天零点（带时分会让 eventsOfDay 误判当天的定时日程已结束）
+  state.selected = new Date(state.selected.getFullYear(), state.selected.getMonth(), state.selected.getDate());
+  // 小屏 → 手机界面；窗口尺寸跨过断点时自动切换（平板横竖屏、桌面缩窗都会触发）
+  applyViewportMode(mobileQuery.matches);
+  const onViewportChange = (e) => applyViewportMode(e.matches);
+  if (mobileQuery.addEventListener) mobileQuery.addEventListener('change', onViewportChange);
+  else if (mobileQuery.addListener) mobileQuery.addListener(onViewportChange);
+
+  // 手机界面默认先看日历（待办用底部标签栏打开），桌面沿用上次的显示状态
+  const wantTodo = state.mobile ? false : (localStorage.getItem('fnCalTodoVisible') !== '0');
+  applyTodoVisibility(wantTodo, false);
   await loadCalendars();
   await refreshAll();
   backgroundSync();
