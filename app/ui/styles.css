@@ -2126,10 +2126,16 @@ body.is-mobile .m-now-line {
 
 /* ---------------- 年视图 ---------------- */
 
+/* 手机下 .main-area 是 overflow:hidden（月视图/时间轴各自在内部滚动），
+   年视图没有内部滚动容器 → 必须把自己变成滚动容器，否则内容被直接裁掉、无法上下滑动 */
 body.is-mobile .year-view {
+  height: 100%;
   grid-template-columns: 1fr;
-  padding: 12px 12px 24px;
+  padding: 12px 12px 88px; /* 底部多留白：避免右下角悬浮新建按钮压住最后一个月的末行 */
   gap: 12px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
 }
 body.is-mobile .ym-title { font-size: 14px; }
 body.is-mobile .ym-cell { height: 30px; line-height: 30px; font-size: 12px; }
